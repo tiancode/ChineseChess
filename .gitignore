@@ -1,0 +1,6 @@
+# Rust build output
+/target
+
+# Local game saves (user data)
+/xiangqi_save.json
+*.save.json
