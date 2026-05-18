@@ -1,0 +1,4 @@
+# Install the CUDA build of torch matching your driver, e.g.:
+#   pip install torch --index-url https://download.pytorch.org/whl/cu124
+torch>=2.1
+numpy>=1.24

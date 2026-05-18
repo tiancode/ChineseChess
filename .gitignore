@@ -4,3 +4,7 @@
 # Local game saves (user data)
 /xiangqi_save.json
 *.save.json
+
+# Python bytecode cache (alphazero subproject)
+__pycache__/
+*.pyc

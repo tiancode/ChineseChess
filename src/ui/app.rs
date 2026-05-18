@@ -6,9 +6,19 @@ use std::thread;
 
 use eframe::egui;
 
-use crate::ai::{make_engine, Engine};
+use crate::ai::{make_engine, Engine, EngineKind};
 use crate::board::*;
 use crate::game::{DrawReason, GameState, GameStatus, SaveGame};
+
+/// Who controls each side.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+enum GameMode {
+    /// Human plays one colour, an engine plays the other.
+    #[default]
+    HumanVsAi,
+    /// Both colours are engines; the match auto-advances.
+    AiVsAi,
+}
 
 /// Blank frame around the board, in points.
 const MARGIN: f32 = 36.0;
@@ -38,6 +48,18 @@ fn from_screen(flip: bool, sf: i32, sr: i32) -> (i32, i32) {
     }
 }
 
+/// A combo box for choosing an [`EngineKind`]. `label` must be unique within
+/// the panel (egui derives the widget id from it).
+fn engine_combo(ui: &mut egui::Ui, label: &str, kind: &mut EngineKind) {
+    egui::ComboBox::from_label(label)
+        .selected_text(kind.label())
+        .show_ui(ui, |ui| {
+            for k in [EngineKind::AlphaBeta, EngineKind::AlphaZero] {
+                ui.selectable_value(kind, k, k.label());
+            }
+        });
+}
+
 type SharedEngine = Arc<Mutex<Box<dyn Engine + Send>>>;
 
 pub struct XiangqiApp {
@@ -50,13 +72,30 @@ pub struct XiangqiApp {
     /// Set when a side resigns; overrides the computed status until reset.
     forced: Option<GameStatus>,
 
+    /// Active mode; `pending_mode` is applied on the next New Game (the same
+    /// deferred-apply pattern as `pending_color`).
+    mode: GameMode,
+    pending_mode: GameMode,
+    /// Active per-side engine kinds; the `pending_*` ones are applied on New
+    /// Game. In Human-vs-AI only the AI side's kind is used.
+    red_kind: EngineKind,
+    black_kind: EngineKind,
+    pending_red_kind: EngineKind,
+    pending_black_kind: EngineKind,
+
     thinking: bool,
     req_id: u64,
     ai_rx: Option<Receiver<(u64, Option<Move>)>>,
+    /// Set when an engine yields no move on a non-terminal position (e.g. the
+    /// AlphaZero sidecar could not start). Stops the auto-loop from spinning;
+    /// cleared on New Game / Undo / Load / a difficulty change.
+    ai_stalled: bool,
 
-    /// Persisted across moves so the transposition table is reused.
-    engine: SharedEngine,
-    /// Difficulty the current `engine` was built for.
+    /// One engine per colour, persisted across moves so each keeps its state
+    /// (e.g. the AlphaBeta transposition table). Only the AI sides are used.
+    engine_red: SharedEngine,
+    engine_black: SharedEngine,
+    /// Difficulty the current engines were built for.
     engine_diff: u8,
     /// Whether a CJK font loaded; if not, pieces are drawn as letters.
     cjk_ok: bool,
@@ -76,10 +115,26 @@ impl XiangqiApp {
             selected: None,
             status: GameStatus::Ongoing,
             forced: None,
+            mode: GameMode::HumanVsAi,
+            pending_mode: GameMode::HumanVsAi,
+            red_kind: EngineKind::AlphaBeta,
+            black_kind: EngineKind::AlphaBeta,
+            pending_red_kind: EngineKind::AlphaBeta,
+            pending_black_kind: EngineKind::AlphaBeta,
             thinking: false,
             req_id: 0,
             ai_rx: None,
-            engine: Arc::new(Mutex::new(make_engine(difficulty, Color::Black))),
+            ai_stalled: false,
+            engine_red: Arc::new(Mutex::new(make_engine(
+                EngineKind::AlphaBeta,
+                difficulty,
+                Color::Red,
+            ))),
+            engine_black: Arc::new(Mutex::new(make_engine(
+                EngineKind::AlphaBeta,
+                difficulty,
+                Color::Black,
+            ))),
             engine_diff: difficulty,
             cjk_ok,
             save_path: "xiangqi_save.json".to_owned(),
@@ -99,20 +154,58 @@ impl XiangqiApp {
         Self::bootstrap(true)
     }
 
-    /// Rebuild the engine (fresh transposition table). Called on a new game
-    /// or when the difficulty changes.
-    fn rebuild_engine(&mut self) {
-        self.engine = Arc::new(Mutex::new(make_engine(self.difficulty, self.ai_color())));
+    /// Rebuild both engines (fresh state). Called on a new game or when the
+    /// difficulty changes. Replacing the `Arc`s drops the old engines; an
+    /// AlphaZero engine's `Drop` shuts down its Python sidecar, and a fresh
+    /// one re-spawns lazily on first use.
+    fn rebuild_engines(&mut self) {
+        self.engine_red = Arc::new(Mutex::new(make_engine(
+            self.red_kind,
+            self.difficulty,
+            Color::Red,
+        )));
+        self.engine_black = Arc::new(Mutex::new(make_engine(
+            self.black_kind,
+            self.difficulty,
+            Color::Black,
+        )));
         self.engine_diff = self.difficulty;
+        self.ai_stalled = false; // a config change is a fresh chance to run
     }
 
+    /// The AI side in Human-vs-AI (meaningless in AI-vs-AI, where both sides
+    /// are engines — callers gate on [`GameMode::HumanVsAi`] first).
     fn ai_color(&self) -> Color {
         self.human_color.opposite()
     }
 
-    /// True when the human side sits at the bottom-flipped board.
+    /// Whether `c` is engine-controlled: both sides in AI-vs-AI, otherwise the
+    /// non-human side.
+    fn is_ai(&self, c: Color) -> bool {
+        match self.mode {
+            GameMode::AiVsAi => true,
+            GameMode::HumanVsAi => c != self.human_color,
+        }
+    }
+
+    fn kind_for(&self, c: Color) -> EngineKind {
+        match c {
+            Color::Red => self.red_kind,
+            Color::Black => self.black_kind,
+        }
+    }
+
+    fn engine_for(&self, c: Color) -> &SharedEngine {
+        match c {
+            Color::Red => &self.engine_red,
+            Color::Black => &self.engine_black,
+        }
+    }
+
+    /// True when the human side sits at the bottom-flipped board. There is no
+    /// human in AI-vs-AI, so the board stays in Red's orientation.
     fn flip(&self) -> bool {
-        self.human_color == Color::Black
+        self.mode == GameMode::HumanVsAi && self.human_color == Color::Black
     }
 
     /// Status to display: a resignation overrides the computed status.
@@ -140,12 +233,15 @@ impl XiangqiApp {
     fn new_game(&mut self) {
         self.game = GameState::new();
         self.human_color = self.pending_color;
+        self.mode = self.pending_mode;
+        self.red_kind = self.pending_red_kind;
+        self.black_kind = self.pending_black_kind;
         self.selected = None;
         self.forced = None;
         self.thinking = false;
         self.ai_rx = None;
         self.req_id += 1;
-        self.rebuild_engine();
+        self.rebuild_engines();
         self.status = self.game.status();
         self.message.clear();
     }
@@ -157,13 +253,18 @@ impl XiangqiApp {
         if !self.game.undo() {
             return;
         }
-        // Step back past the AI's reply too, so it is the human's turn again.
-        if self.game.side_to_move != self.human_color && !self.game.history.is_empty() {
+        // In Human-vs-AI, step back past the AI's reply too so it is the
+        // human's turn again. In AI-vs-AI a single ply is the natural step.
+        if self.mode == GameMode::HumanVsAi
+            && self.game.side_to_move != self.human_color
+            && !self.game.history.is_empty()
+        {
             self.game.undo();
         }
         self.selected = None;
         self.forced = None;
         self.req_id += 1;
+        self.ai_stalled = false;
         self.status = self.game.status();
         self.message.clear();
     }
@@ -201,6 +302,7 @@ impl XiangqiApp {
                 self.thinking = false;
                 self.ai_rx = None;
                 self.req_id += 1;
+                self.ai_stalled = false;
                 self.status = self.game.status();
                 self.message = format!("已从 {} 载入", self.save_path);
             }
@@ -208,18 +310,22 @@ impl XiangqiApp {
         }
     }
 
-    /// Spawn a background search if it is the AI's move.
+    /// Spawn a background search if the side to move is engine-controlled.
+    /// In AI-vs-AI this fires for whichever colour is on move, so the match
+    /// auto-advances: `poll_ai` applies the move and flips the turn, and the
+    /// next frame starts the other engine.
     fn maybe_start_ai(&mut self, ctx: &egui::Context) {
-        if self.thinking || self.game_over() {
+        if self.thinking || self.game_over() || self.ai_stalled {
             return;
         }
-        if self.game.side_to_move != self.ai_color() {
+        let side = self.game.side_to_move;
+        if !self.is_ai(side) {
             return;
         }
         let (tx, rx) = mpsc::channel();
         let game = self.game.clone();
         let id = self.req_id;
-        let engine = Arc::clone(&self.engine);
+        let engine = Arc::clone(self.engine_for(side));
         thread::spawn(move || {
             let mv = match engine.lock() {
                 Ok(mut e) => e.best_move(&game),
@@ -242,11 +348,22 @@ impl XiangqiApp {
             self.thinking = false;
             self.ai_rx = None;
             if id == self.req_id {
-                if let Some(mv) = mv {
-                    if self.game.is_legal(mv) {
+                match mv {
+                    Some(mv) if self.game.is_legal(mv) => {
                         self.game.apply(mv);
                         self.status = self.game.status();
                     }
+                    // No usable move on a live position means the engine
+                    // failed (most often: the AlphaZero sidecar could not
+                    // start). Stop the auto-loop instead of respawning every
+                    // frame; New Game / Undo / a difficulty change retries.
+                    _ if !self.game_over() => {
+                        self.ai_stalled = true;
+                        self.message = "AI 无法走子（引擎无响应或环境异常）。\
+                             请重开对局，或检查 Python、torch 与模型文件。"
+                            .to_owned();
+                    }
+                    _ => {}
                 }
             }
         } else {
@@ -255,7 +372,10 @@ impl XiangqiApp {
     }
 
     fn human_can_move(&self) -> bool {
-        !self.thinking && !self.game_over() && self.game.side_to_move == self.human_color
+        self.mode == GameMode::HumanVsAi
+            && !self.thinking
+            && !self.game_over()
+            && self.game.side_to_move == self.human_color
     }
 
     fn legal_targets(&mut self) -> Vec<usize> {
@@ -302,13 +422,15 @@ impl XiangqiApp {
         self.on_click_square(idx(f, r));
     }
 
-    /// Synchronous AI move, for tests (no threads / egui context).
+    /// Synchronous engine move for the side to move, for tests (no threads /
+    /// egui context). Call it repeatedly to play a whole AI-vs-AI game.
     #[cfg(test)]
     fn run_ai_blocking(&mut self) {
-        if self.thinking || self.game_over() || self.game.side_to_move != self.ai_color() {
+        let side = self.game.side_to_move;
+        if self.thinking || self.game_over() || !self.is_ai(side) {
             return;
         }
-        let mv = self.engine.lock().unwrap().best_move(&self.game);
+        let mv = self.engine_for(side).lock().unwrap().best_move(&self.game);
         if let Some(mv) = mv {
             if self.game.is_legal(mv) {
                 self.game.apply(mv);
@@ -329,14 +451,18 @@ impl XiangqiApp {
             GameStatus::Draw(DrawReason::NoCapture) => "和棋（60 回合无吃子）".to_owned(),
             GameStatus::Check(c) => format!("{} 被将军", side(c)),
             GameStatus::Ongoing => {
-                let who = if self.game.side_to_move == self.human_color {
-                    "你"
-                } else if self.thinking {
-                    "AI 思考中…"
+                let stm = self.game.side_to_move;
+                let who = if self.mode == GameMode::HumanVsAi && stm == self.human_color {
+                    "你".to_owned()
                 } else {
-                    "AI"
+                    let k = self.kind_for(stm).label();
+                    if self.thinking {
+                        format!("{k} 思考中…")
+                    } else {
+                        k.to_owned()
+                    }
                 };
-                format!("轮到 {}（{}）", side(self.game.side_to_move), who)
+                format!("轮到 {}（{}）", side(stm), who)
             }
         }
     }
@@ -345,9 +471,9 @@ impl XiangqiApp {
 impl eframe::App for XiangqiApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.poll_ai(ctx);
-        // Apply a difficulty change while idle (rebuilds the engine/TT).
+        // Apply a difficulty change while idle (rebuilds both engines).
         if !self.thinking && self.difficulty != self.engine_diff {
-            self.rebuild_engine();
+            self.rebuild_engines();
         }
         self.maybe_start_ai(ctx);
 
@@ -376,11 +502,44 @@ impl XiangqiApp {
                 ui.label(st);
                 ui.add_space(6.0);
 
-                ui.label("新对局执棋：");
+                ui.label("对战模式：");
                 ui.horizontal(|ui| {
-                    ui.radio_value(&mut self.pending_color, Color::Red, "红（先手）");
-                    ui.radio_value(&mut self.pending_color, Color::Black, "黑（后手）");
+                    ui.radio_value(
+                        &mut self.pending_mode,
+                        GameMode::HumanVsAi,
+                        "人机对战",
+                    );
+                    ui.radio_value(&mut self.pending_mode, GameMode::AiVsAi, "AI 对战");
                 });
+
+                match self.pending_mode {
+                    GameMode::HumanVsAi => {
+                        ui.label("你执：");
+                        ui.horizontal(|ui| {
+                            ui.radio_value(
+                                &mut self.pending_color,
+                                Color::Red,
+                                "红（先手）",
+                            );
+                            ui.radio_value(
+                                &mut self.pending_color,
+                                Color::Black,
+                                "黑（后手）",
+                            );
+                        });
+                        // The engine plays the other colour.
+                        let sel = if self.pending_color == Color::Red {
+                            &mut self.pending_black_kind
+                        } else {
+                            &mut self.pending_red_kind
+                        };
+                        engine_combo(ui, "AI 引擎", sel);
+                    }
+                    GameMode::AiVsAi => {
+                        engine_combo(ui, "红方引擎", &mut self.pending_red_kind);
+                        engine_combo(ui, "黑方引擎", &mut self.pending_black_kind);
+                    }
+                }
                 if ui.button("开始新对局").clicked() {
                     self.new_game();
                 }
@@ -388,7 +547,7 @@ impl XiangqiApp {
                 ui.add_space(8.0);
                 ui.add(
                     egui::Slider::new(&mut self.difficulty, 1..=5)
-                        .text("AI 难度（1–5）"),
+                        .text("AI 难度（1–5；AlphaZero 为 MCTS 模拟数）"),
                 );
 
                 ui.add_space(8.0);
@@ -396,8 +555,10 @@ impl XiangqiApp {
                     if ui.button("悔棋").clicked() {
                         self.undo();
                     }
+                    let can_resign =
+                        self.mode == GameMode::HumanVsAi && !self.game_over();
                     if ui
-                        .add_enabled(!self.game_over(), egui::Button::new("认输"))
+                        .add_enabled(can_resign, egui::Button::new("认输"))
                         .clicked()
                     {
                         self.resign();
@@ -683,7 +844,7 @@ mod ui_tests {
     fn undo_steps_back_past_ai_reply() {
         let mut app = XiangqiApp::headless();
         app.difficulty = 1;
-        app.rebuild_engine();
+        app.rebuild_engines();
         app.handle_screen_click(0, 6);
         app.handle_screen_click(0, 5);
         assert_eq!(app.game.side_to_move, Color::Black);
@@ -707,12 +868,44 @@ mod ui_tests {
     }
 
     #[test]
+    fn ai_vs_ai_alphabeta_auto_plays() {
+        let mut app = XiangqiApp::headless();
+        app.difficulty = 1;
+        app.pending_mode = GameMode::AiVsAi;
+        app.new_game();
+        assert_eq!(app.mode, GameMode::AiVsAi);
+        assert!(!app.flip(), "no human side -> Red's orientation");
+        assert!(!app.human_can_move());
+
+        for _ in 0..6 {
+            if app.game_over() {
+                break;
+            }
+            let before = app.game.history.len();
+            app.run_ai_blocking();
+            assert_eq!(
+                app.game.history.len(),
+                before + 1,
+                "the side to move should have played"
+            );
+        }
+        assert!(app.game.history.len() >= 4);
+        // Turn strictly alternates from Red.
+        let expect = if app.game.history.len().is_multiple_of(2) {
+            Color::Red
+        } else {
+            Color::Black
+        };
+        assert_eq!(app.game.side_to_move, expect);
+    }
+
+    #[test]
     fn ai_moves_first_when_human_is_black() {
         let mut app = XiangqiApp::headless();
         app.pending_color = Color::Black;
         app.new_game(); // human Black, AI Red, Red to move
         app.difficulty = 1;
-        app.rebuild_engine();
+        app.rebuild_engines();
         assert!(app.flip());
         app.run_ai_blocking();
         assert_eq!(app.game.history.len(), 1);
@@ -725,7 +918,7 @@ mod ui_tests {
         app.pending_color = Color::Black;
         app.new_game();
         app.difficulty = 1;
-        app.rebuild_engine();
+        app.rebuild_engines();
         app.run_ai_blocking(); // AI (Red) moves; human (Black) to move, flipped
         assert_eq!(app.game.side_to_move, Color::Black);
 

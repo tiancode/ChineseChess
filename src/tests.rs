@@ -5,7 +5,7 @@
 //! position and the engine will correctly reject every move from it.
 
 use crate::ai::search::SearchEngine;
-use crate::ai::{make_engine, Engine};
+use crate::ai::{make_engine, Engine, EngineKind};
 use crate::board::*;
 use crate::game::{DrawReason, GameState, GameStatus};
 use crate::moves::{generals_face, in_check, legal_moves};
@@ -160,9 +160,29 @@ fn threefold_repetition_is_a_draw() {
 #[test]
 fn ai_returns_a_legal_move() {
     let mut g = GameState::new();
-    let mut engine = make_engine(2, Color::Red);
+    let mut engine = make_engine(EngineKind::AlphaBeta, 2, Color::Red);
     let mv = engine.best_move(&g).expect("engine should find a move");
     assert!(g.is_legal(mv));
+}
+
+/// End-to-end check of the Python AlphaZero sidecar (`alphazero/serve.py`)
+/// through the Rust subprocess client. Needs Python + torch + the checkpoint,
+/// so it is not run by default:
+/// `cargo test alphazero_sidecar -- --ignored --nocapture`
+#[test]
+#[ignore]
+fn alphazero_sidecar_returns_legal_move() {
+    use crate::ai::alphazero::AlphaZeroEngine;
+    let mut g = GameState::new();
+    let mut e = AlphaZeroEngine::new(16); // few sims -> fast
+    let mv = e
+        .best_move(&g)
+        .expect("sidecar should return a move from the start position");
+    assert!(g.is_legal(mv), "sidecar move must be legal: {mv:?}");
+    g.apply(mv);
+    // A second call exercises history replay (Black to move now).
+    let mv2 = e.best_move(&g).expect("sidecar should return a reply");
+    assert!(g.is_legal(mv2), "second sidecar move must be legal: {mv2:?}");
 }
 
 /// Not run by default. `cargo test engine_benchmark -- --ignored --nocapture`
