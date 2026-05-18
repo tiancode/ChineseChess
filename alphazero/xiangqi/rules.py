@@ -196,3 +196,69 @@ def legal_moves(board: np.ndarray, color: int) -> list:
             legal.append(mv)
         unmake(board, mv, captured)
     return legal
+
+
+# ---------------------------------------------------------------------------
+# Repetition-rule support: classifying a move as check / chase / idle for the
+# CCA (Asian) perpetual-check / perpetual-chase rules. Mirrors moves.rs.
+# ---------------------------------------------------------------------------
+
+# Move tags, ordered by offence severity (used directly as offence "levels").
+TAG_IDLE = 0
+TAG_CHASE = 1
+TAG_CHECK = 2
+
+_PIECE_VALUE = {
+    GENERAL: 0, CHARIOT: 1000, CANNON: 500, HORSE: 450,
+    ADVISOR: 200, ELEPHANT: 200, SOLDIER: 100,
+}
+
+
+def piece_value(kind: int) -> int:
+    """Nominal piece value (same scale as ``moves.rs::piece_value``). The
+    general is 0 -- it is never a chase target (threatening it is *check*)."""
+    return _PIECE_VALUE[kind]
+
+
+def gives_check(board: np.ndarray, mover: int) -> bool:
+    """``board`` is past ``mover``'s move (opponent to move): is the
+    opponent's general now in check?"""
+    return in_check(board, opposite(mover))
+
+
+def threatens_win(board: np.ndarray, mover: int) -> bool:
+    """Does ``mover`` threaten to win material next move (a CCA "chase")?
+
+    Same exclusions as ``moves.rs::threatens_win``: the general is never a
+    chase victim; a pawn/general doing the threatening is idle; an
+    adequately-defended victim is a chase only if taking it still wins
+    material. ``board`` is the position after ``mover``'s move.
+    """
+    for m in legal_moves(board, mover):
+        victim = int(board[m[1]])
+        if victim == 0:
+            continue  # not a capture
+        if piece_kind(victim) == GENERAL:
+            continue  # that is check, classified elsewhere
+        atk = int(board[m[0]])
+        if atk == 0 or piece_kind(atk) in (SOLDIER, GENERAL):
+            continue  # a pawn/general chase is idle under CCA
+        after = board.copy()
+        make(after, m)
+        defended = is_attacked(after, m[1], opposite(mover))
+        if (not defended
+                or piece_value(piece_kind(victim)) > piece_value(piece_kind(atk))):
+            return True
+    return False
+
+
+def tag_move(board_before: np.ndarray, mv, mover: int) -> int:
+    """Classify ``mv`` (played by ``mover`` from ``board_before``). Check
+    outranks chase."""
+    b = board_before.copy()
+    make(b, mv)
+    if gives_check(b, mover):
+        return TAG_CHECK
+    if threatens_win(b, mover):
+        return TAG_CHASE
+    return TAG_IDLE

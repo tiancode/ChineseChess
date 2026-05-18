@@ -202,3 +202,94 @@ pub fn legal_moves(board: &mut Board, color: Color) -> Vec<Move> {
     }
     legal
 }
+
+// ---------------------------------------------------------------------------
+// Repetition-rule support: classifying a move as check / chase / idle so the
+// CCA (Asian) perpetual-check / perpetual-chase rules can be applied.
+// ---------------------------------------------------------------------------
+
+/// Nominal piece values (centipawns). Shared with the engine's material term
+/// so the chase "wins material?" test uses the same scale. `General` is 0:
+/// it is never a chase target (threatening it is *check*, handled separately).
+pub fn piece_value(kind: PieceKind) -> i32 {
+    match kind {
+        PieceKind::General => 0,
+        PieceKind::Chariot => 1000,
+        PieceKind::Cannon => 500,
+        PieceKind::Horse => 450,
+        PieceKind::Advisor => 200,
+        PieceKind::Elephant => 200,
+        PieceKind::Soldier => 100,
+    }
+}
+
+/// Does the position (already advanced past `mover`'s move, so it is the
+/// opponent to move) leave the opponent's general in check?
+pub fn gives_check(board: &Board, mover: Color) -> bool {
+    in_check(board, mover.opposite())
+}
+
+/// Is `mover` "chasing" (捉) in this position — i.e. threatening to capture an
+/// opponent piece next move at a net material profit? CCA exclusions applied:
+///
+/// - The general is never a chase victim (that threat is *check*).
+/// - A pawn or the general doing the threatening counts as idle, not chase
+///   (兵/帅 之捉算闲).
+/// - An adequately-defended victim is only a chase if taking it still wins
+///   material (value(victim) > value(attacker)); an equal/again-defended
+///   trade is 兑/idle, not 捉.
+///
+/// `board` is the position *after* `mover`'s move (opponent to move). Only
+/// legal captures for `mover` are considered, so the threat is real.
+pub fn threatens_win(board: &Board, mover: Color) -> bool {
+    let mut b = *board;
+    for m in legal_moves(&mut b, mover) {
+        let Some(victim) = board.get(m.to) else {
+            continue; // not a capture
+        };
+        if victim.kind == PieceKind::General {
+            continue; // that is check, classified elsewhere
+        }
+        let attacker = match board.get(m.from) {
+            Some(p) => p,
+            None => continue,
+        };
+        if matches!(attacker.kind, PieceKind::Soldier | PieceKind::General) {
+            continue; // a pawn/general chase is idle under CCA
+        }
+        // 1-ply static exchange: undefended victim is pure profit; a defended
+        // one is only a chase if we still come out ahead after the recapture.
+        let mut after = *board;
+        let cap = after.make(m);
+        let defended = is_attacked(&after, m.to, mover.opposite());
+        after.unmake(m, cap);
+        if !defended || piece_value(victim.kind) > piece_value(attacker.kind) {
+            return true;
+        }
+    }
+    false
+}
+
+/// What a single move "does" for the side to move, used by the repetition
+/// rules. Check takes precedence over chase.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MoveTag {
+    Check,
+    Chase,
+    Idle,
+}
+
+/// Classify `mv` (played by `mover` from `board_before`).
+pub fn tag_move(board_before: &Board, mv: Move, mover: Color) -> MoveTag {
+    let mut b = *board_before;
+    let cap = b.make(mv);
+    let tag = if gives_check(&b, mover) {
+        MoveTag::Check
+    } else if threatens_win(&b, mover) {
+        MoveTag::Chase
+    } else {
+        MoveTag::Idle
+    };
+    b.unmake(mv, cap);
+    tag
+}

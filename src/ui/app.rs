@@ -8,7 +8,7 @@ use eframe::egui;
 
 use crate::ai::{make_engine, Engine, EngineKind};
 use crate::board::*;
-use crate::game::{DrawReason, GameState, GameStatus, SaveGame};
+use crate::game::{DrawReason, GameState, GameStatus, RepKind, SaveGame};
 
 /// Who controls each side.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -271,7 +271,10 @@ impl XiangqiApp {
     fn game_over(&self) -> bool {
         matches!(
             self.eff_status(),
-            GameStatus::Win(_) | GameStatus::Stalemate(_) | GameStatus::Draw(_)
+            GameStatus::Win(_)
+                | GameStatus::Stalemate(_)
+                | GameStatus::Draw(_)
+                | GameStatus::PerpetualLoss { .. }
         )
     }
 
@@ -513,7 +516,16 @@ impl XiangqiApp {
                 format!("{}！{} 胜", how, side(c))
             }
             GameStatus::Stalemate(c) => format!("困毙！{} 胜", side(c)),
-            GameStatus::Draw(DrawReason::Repetition) => "和棋（三次重复局面）".to_owned(),
+            GameStatus::PerpetualLoss { winner, kind } => {
+                let how = match kind {
+                    RepKind::Check => "长将判负",
+                    RepKind::Chase => "长捉判负",
+                };
+                format!("{}！{} 胜", how, side(winner))
+            }
+            GameStatus::Draw(DrawReason::Repetition) => {
+                "和棋（重复局面，双方均未犯规）".to_owned()
+            }
             GameStatus::Draw(DrawReason::NoCapture) => "和棋（60 回合无吃子）".to_owned(),
             GameStatus::Check(c) => format!("{} 被将军", side(c)),
             GameStatus::Ongoing => {

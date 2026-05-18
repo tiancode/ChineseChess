@@ -2,17 +2,24 @@
 detection, and Xiangqi terminal scoring.
 
 Terminal rule (identical to ``game.rs``): a side with no legal move *loses*
-whether it is checkmated or stalemated. Threefold repetition and the
-no-capture limit are scored as draws (the same deliberate simplification the
-Rust engine makes -- perpetual check/chase is not specially punished).
+whether it is checkmated or stalemated. Threefold repetition is judged by the
+CCA / Asian rules (see ``_repetition_judgment``, a mirror of
+``game.rs::repetition_judgment``): perpetual check / chase is a loss for the
+offending side; only a mutual or idle repetition draws. The no-capture limit
+is still a draw. Documented approximations match the Rust side (chase = a
+1-ply static-exchange test; pawn/general as the chaser is idle; ambiguous
+sub-cases follow the common CCA interpretation).
 """
 
 from __future__ import annotations
 
 import numpy as np
 
-from .board import RED, CELLS, initial_board
-from .rules import legal_moves, in_check, make, unmake
+from .board import RED, BLACK, CELLS, initial_board
+from .rules import (
+    legal_moves, in_check, make, unmake,
+    tag_move, TAG_CHECK, TAG_CHASE,
+)
 
 # Plies without a capture after which the game is a draw (60 full moves).
 NO_CAPTURE_PLY_LIMIT = 120
@@ -87,17 +94,81 @@ class GameState:
         h = self.hashes[-1]
         return self.hashes.count(h)
 
+    def _repetition_judgment(self) -> float:
+        """CCA / Asian ruling for the just-repeated position; a mirror of
+        ``game.rs::repetition_judgment``. Returns the value *for the side to
+        move*: ``-1.0`` if it is the offending (perpetual check/chase) side,
+        ``+1.0`` if the opponent is, ``0.0`` for a mutual or plain idle
+        repetition.
+        """
+        last = len(self.history)            # hashes[last] == current position
+        cur = self.hashes[last]
+        j = -1
+        for k in range(last - 1, -1, -1):
+            if self.hashes[k] == cur:
+                j = k
+                break
+        if j < 0:
+            return 0.0
+
+        # Rewind a copy to the cycle's start, then replay it tagging moves.
+        b = self.board.copy()
+        for mv, cap in reversed(self.history[j:last]):
+            unmake(b, mv, cap)
+
+        # agg[color] = [moves, checks, aggressive, chases]
+        agg = [[0, 0, 0, 0], [0, 0, 0, 0]]
+        for i in range(j, last):
+            # Mover of move i, derived from the current side to move.
+            mover = self.side_to_move if (last - i) % 2 == 0 else (self.side_to_move ^ 1)
+            mv = self.history[i][0]
+            a = agg[mover]
+            a[0] += 1
+            tag = tag_move(b, mv, mover)
+            if tag == TAG_CHECK:
+                a[1] += 1
+                a[2] += 1
+            elif tag == TAG_CHASE:
+                a[2] += 1
+                a[3] += 1
+            make(b, mv)
+
+        def level(a):
+            if a[0] > 0 and a[1] == a[0]:
+                return 2  # 长将: every move a check
+            if a[0] > 0 and a[2] == a[0] and a[3] > 0:
+                return 1  # 长捉: every move aggressive, at least one chase
+            return 0
+
+        rl, bl = level(agg[RED]), level(agg[BLACK])
+        if (rl, bl) in ((0, 0), (2, 2), (1, 1)):
+            loser = None
+        elif bl == 0:
+            loser = RED
+        elif rl == 0:
+            loser = BLACK
+        elif (rl, bl) == (2, 1):       # 一将一捉: perpetual-check side loses
+            loser = RED
+        elif (rl, bl) == (1, 2):
+            loser = BLACK
+        else:
+            loser = None
+        if loser is None:
+            return 0.0
+        return -1.0 if loser == self.side_to_move else 1.0
+
     def terminal_value(self):
         """Value for the side to move if the game is over, else ``None``.
 
-        A side with no legal reply loses (-1). Repetition / no-capture are
-        draws (0). The winning side's +1 is produced by negamax backup in the
-        searcher, so a positive terminal value never needs representing here.
+        A side with no legal reply loses (-1). A threefold repetition is ruled
+        by ``_repetition_judgment`` (CCA): perpetual check/chase loses for the
+        offender, so this may return -1.0, 0.0 *or* +1.0 (the victim of a
+        perpetual already wins here). The no-capture limit is a draw (0).
         """
         if not self.legal_moves():
             return -1.0  # no reply: side to move loses (mate or stalemate)
         if self._repetition_count() >= 3:
-            return 0.0
+            return self._repetition_judgment()
         if self._plies_since_capture() >= NO_CAPTURE_PLY_LIMIT:
             return 0.0
         return None

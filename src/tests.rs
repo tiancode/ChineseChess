@@ -7,8 +7,8 @@
 use crate::ai::search::SearchEngine;
 use crate::ai::{make_engine, Engine, EngineKind};
 use crate::board::*;
-use crate::game::{DrawReason, GameState, GameStatus};
-use crate::moves::{generals_face, in_check, legal_moves};
+use crate::game::{DrawReason, GameState, GameStatus, RepKind};
+use crate::moves::{generals_face, in_check, legal_moves, tag_move, MoveTag};
 
 fn place(b: &mut Board, f: i32, r: i32, kind: PieceKind, color: Color) {
     b.cells[idx(f, r)] = Some(Piece { kind, color });
@@ -151,6 +151,130 @@ fn threefold_repetition_is_a_draw() {
     for _ in 0..2 {
         for mv in cycle {
             assert!(g.is_legal(mv), "shuffle move should be legal: {mv:?}");
+            g.apply(mv);
+        }
+    }
+    // Also the regression for the CCA change: both sides idle every move, so
+    // a plain positional repetition must still be a draw.
+    assert_eq!(g.status(), GameStatus::Draw(DrawReason::Repetition));
+}
+
+// --- CCA / Asian repetition rules ------------------------------------------
+
+#[test]
+fn tag_move_check_chase_idle() {
+    // Check: a chariot move that gives check.
+    let mut b = Board::empty();
+    place(&mut b, 0, 9, PieceKind::General, Color::Red);
+    place(&mut b, 4, 0, PieceKind::General, Color::Black);
+    place(&mut b, 4, 5, PieceKind::Chariot, Color::Red);
+    let mv = Move { from: idx(4, 5), to: idx(4, 1) }; // file 4 -> checks Bgen
+    assert_eq!(tag_move(&b, mv, Color::Red), MoveTag::Check);
+
+    // Chase: rook swings to attack an *undefended* horse, no check.
+    let mut b = Board::empty();
+    place(&mut b, 0, 9, PieceKind::General, Color::Red);
+    place(&mut b, 8, 0, PieceKind::General, Color::Black);
+    place(&mut b, 0, 4, PieceKind::Chariot, Color::Red);
+    place(&mut b, 4, 2, PieceKind::Horse, Color::Black);
+    let chase = Move { from: idx(0, 4), to: idx(4, 4) }; // then threatens (4,2)
+    assert_eq!(tag_move(&b, chase, Color::Red), MoveTag::Chase);
+
+    // Same, but the horse is defended by a soldier: an unfavourable trade is
+    // not a chase -> idle.
+    place(&mut b, 4, 1, PieceKind::Soldier, Color::Black); // Black pawn guards (4,2)
+    assert_eq!(tag_move(&b, chase, Color::Red), MoveTag::Idle);
+
+    // A pawn doing the threatening is idle (兵之捉算闲), never a chase.
+    let mut b = Board::empty();
+    place(&mut b, 0, 9, PieceKind::General, Color::Red);
+    place(&mut b, 8, 0, PieceKind::General, Color::Black);
+    place(&mut b, 5, 4, PieceKind::Soldier, Color::Red); // crossed-river pawn
+    place(&mut b, 4, 3, PieceKind::Horse, Color::Black); // undefended
+    let pawn = Move { from: idx(5, 4), to: idx(5, 3) }; // then pawn eyes (4,3)
+    assert_eq!(tag_move(&b, pawn, Color::Red), MoveTag::Idle);
+}
+
+#[test]
+fn perpetual_check_loses() {
+    // Red chariot perpetually checks a bare Black king; Black only shuffles.
+    // Red is 长将 -> Red loses, Black wins.
+    let mut b = Board::empty();
+    place(&mut b, 3, 9, PieceKind::General, Color::Red);
+    place(&mut b, 4, 0, PieceKind::General, Color::Black);
+    place(&mut b, 0, 0, PieceKind::Chariot, Color::Red); // checks Bgen on rank 0
+    let mut g = GameState::with_position(b, Color::Black); // Black in check
+
+    let cycle = [
+        Move { from: idx(4, 0), to: idx(4, 1) }, // Black king escapes
+        Move { from: idx(0, 0), to: idx(0, 1) }, // Red re-checks on rank 1
+        Move { from: idx(4, 1), to: idx(4, 0) }, // Black king back
+        Move { from: idx(0, 1), to: idx(0, 0) }, // Red re-checks on rank 0
+    ];
+    for _ in 0..2 {
+        for mv in cycle {
+            assert!(g.is_legal(mv), "cycle move should be legal: {mv:?}");
+            g.apply(mv);
+        }
+    }
+    assert_eq!(
+        g.status(),
+        GameStatus::PerpetualLoss { winner: Color::Black, kind: RepKind::Check }
+    );
+}
+
+#[test]
+fn perpetual_chase_loses() {
+    // Red chariot oscillates on file 4, attacking a fixed undefended Black
+    // horse every move (长捉); Black shuffles an idle horse far away.
+    let mut b = Board::empty();
+    place(&mut b, 0, 9, PieceKind::General, Color::Red);
+    place(&mut b, 4, 0, PieceKind::General, Color::Black);
+    place(&mut b, 4, 9, PieceKind::Chariot, Color::Red); // eyes horse down file 4
+    place(&mut b, 4, 4, PieceKind::Horse, Color::Black); // undefended target
+    place(&mut b, 0, 0, PieceKind::Horse, Color::Black); // idle shuffler
+    let mut g = GameState::with_position(b, Color::Red);
+
+    let cycle = [
+        Move { from: idx(4, 9), to: idx(4, 8) }, // Red keeps chasing the horse
+        Move { from: idx(0, 0), to: idx(2, 1) }, // Black idles
+        Move { from: idx(4, 8), to: idx(4, 9) }, // Red keeps chasing
+        Move { from: idx(2, 1), to: idx(0, 0) }, // Black idles back
+    ];
+    for _ in 0..2 {
+        for mv in cycle {
+            assert!(g.is_legal(mv), "cycle move should be legal: {mv:?}");
+            g.apply(mv);
+        }
+    }
+    assert_eq!(
+        g.status(),
+        GameStatus::PerpetualLoss { winner: Color::Black, kind: RepKind::Chase }
+    );
+}
+
+#[test]
+fn defended_chase_is_a_draw() {
+    // Same shape, but the horse is defended so taking it loses material: the
+    // rook's moves are not a chase -> both sides idle -> draw.
+    let mut b = Board::empty();
+    place(&mut b, 0, 9, PieceKind::General, Color::Red);
+    place(&mut b, 4, 0, PieceKind::General, Color::Black);
+    place(&mut b, 4, 9, PieceKind::Chariot, Color::Red);
+    place(&mut b, 4, 4, PieceKind::Horse, Color::Black);
+    place(&mut b, 4, 3, PieceKind::Soldier, Color::Black); // guards the horse
+    place(&mut b, 0, 0, PieceKind::Horse, Color::Black);
+    let mut g = GameState::with_position(b, Color::Red);
+
+    let cycle = [
+        Move { from: idx(4, 9), to: idx(4, 8) },
+        Move { from: idx(0, 0), to: idx(2, 1) },
+        Move { from: idx(4, 8), to: idx(4, 9) },
+        Move { from: idx(2, 1), to: idx(0, 0) },
+    ];
+    for _ in 0..2 {
+        for mv in cycle {
+            assert!(g.is_legal(mv), "cycle move should be legal: {mv:?}");
             g.apply(mv);
         }
     }

@@ -12,7 +12,10 @@ use std::time::{Duration, Instant};
 use super::Engine;
 use crate::board::*;
 use crate::game::GameState;
-use crate::moves::legal_moves;
+use crate::moves::{in_check, legal_moves};
+// Single source of truth for piece values: the engine's material term and the
+// repetition rules' chase test must agree on the scale.
+use crate::moves::piece_value as base_value;
 
 const INF: i32 = 32_001;
 const MATE: i32 = 30_000;
@@ -130,18 +133,6 @@ impl Tt {
 // Evaluation.
 // ----------------------------------------------------------------------------
 
-fn base_value(kind: PieceKind) -> i32 {
-    match kind {
-        PieceKind::General => 0, // both always present -> handled via mate
-        PieceKind::Chariot => 1000,
-        PieceKind::Cannon => 500,
-        PieceKind::Horse => 450,
-        PieceKind::Advisor => 200,
-        PieceKind::Elephant => 200,
-        PieceKind::Soldier => 100,
-    }
-}
-
 // Piece-square tables in Red orientation: index [rank][file], rank 9 is Red's
 // home edge, rank 0 is Black's. Black pieces read the rank-mirrored entry.
 #[rustfmt::skip]
@@ -239,6 +230,10 @@ pub struct SearchEngine {
     /// How many times each position occurred in the actual game so far.
     game_counts: HashMap<u64, u32>,
     path: Vec<u64>,
+    /// Parallel to `path`: did the move that produced that position give
+    /// check? Used to score a repetition reached by perpetual check (长将)
+    /// as a loss for the checking side, instead of a flat draw.
+    path_check: Vec<bool>,
 }
 
 impl SearchEngine {
@@ -259,6 +254,7 @@ impl SearchEngine {
             aborted: false,
             game_counts: HashMap::new(),
             path: Vec::with_capacity(MAX_PLY),
+            path_check: Vec::with_capacity(MAX_PLY),
         }
     }
 
@@ -382,6 +378,46 @@ impl SearchEngine {
         alpha
     }
 
+    /// Score a just-detected threefold repetition. If the repeating cycle
+    /// (taken from the most recent identical position on the search path) was
+    /// a one-sided *perpetual check*, the checking side loses (CCA rule);
+    /// otherwise — mutual perpetual check, or anything not all-checks — it is
+    /// a draw (0). `here_check` is whether the move into this node checked.
+    ///
+    /// Only cycles wholly within the search path are classified; a repetition
+    /// formed against pre-root game history falls back to a draw here (the
+    /// authoritative ruling is `GameState::status`).
+    fn repetition_score(&self, key: u64, ply: usize, here_check: bool) -> i32 {
+        let m = self.path.len();
+        let Some(p) = (0..m).rev().find(|&t| self.path[t] == key) else {
+            return 0; // repetition via game history only: treat as draw
+        };
+        let k = m - p; // cycle length in plies (even, >= 2)
+        // Cycle move j (0..k) is by `side` when j is even, else the opponent.
+        // Its check flag is path_check at the destination position, except the
+        // final move into this node, which is `here_check`.
+        let mut all_self = true; // every `side` move in the cycle is a check
+        let mut all_opp = true; // every opponent move in the cycle is a check
+        for j in 0..k {
+            let checks = if j < k - 1 {
+                self.path_check[p + 1 + j]
+            } else {
+                here_check
+            };
+            if j % 2 == 0 {
+                all_self &= checks;
+            } else {
+                all_opp &= checks;
+            }
+        }
+        match (all_self, all_opp) {
+            (true, true) => 0,                       // mutual perpetual check
+            (true, false) => -MATE + ply as i32,     // `side` perpetually checks: loses
+            (false, true) => MATE - ply as i32,      // opponent perpetually checks: loses
+            (false, false) => 0,                     // not perpetual check
+        }
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn search(
         &mut self,
@@ -398,15 +434,21 @@ impl SearchEngine {
         }
 
         let key = zkey(board, side);
+        // Did the move that led to this node give check (i.e. is the side to
+        // move now in check)? Recorded into `path_check` for perpetual-check
+        // scoring of repetitions.
+        let here_check = ply > 0 && in_check(board, side);
 
-        // Threefold-repetition draw: count this position's prior occurrences
-        // in the real game plus on the current search line; if reaching it
-        // again makes three, it is a draw.
+        // Threefold repetition: this position plus two prior occurrences (in
+        // the real game and/or on the current search line). Under CCA rules a
+        // repetition reached by *perpetual check* is a loss for the checking
+        // side, not a draw. (Perpetual chase is left to the game-level rule;
+        // the search treats it as a draw — see module notes.)
         if ply > 0 {
             let in_game = self.game_counts.get(&key).copied().unwrap_or(0) as usize;
             let in_path = self.path.iter().filter(|&&k| k == key).count();
             if in_game + in_path >= 2 {
-                return 0;
+                return self.repetition_score(key, ply, here_check);
             }
         }
 
@@ -442,6 +484,7 @@ impl SearchEngine {
         order_moves(board, &mut moves, tt_move, &killers);
 
         self.path.push(key);
+        self.path_check.push(here_check);
         let mut best_score = -INF;
         let mut best_move = None;
         let mut first = true;
@@ -471,6 +514,7 @@ impl SearchEngine {
 
             if self.aborted {
                 self.path.pop();
+                self.path_check.pop();
                 return 0;
             }
             if score > best_score {
@@ -493,6 +537,7 @@ impl SearchEngine {
             }
         }
         self.path.pop();
+        self.path_check.pop();
 
         let bound = if best_score <= alpha_orig {
             Bound::Upper
@@ -545,6 +590,7 @@ impl Engine for SearchEngine {
 
         self.build_repetition(state);
         self.path.clear();
+        self.path_check.clear();
         self.deadline = Instant::now() + self.budget;
         self.nodes = 0;
         self.aborted = false;

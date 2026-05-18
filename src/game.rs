@@ -2,7 +2,7 @@
 //! human-readable notation, and JSON save/load.
 
 use crate::board::*;
-use crate::moves::{in_check, legal_moves};
+use crate::moves::{in_check, legal_moves, tag_move, MoveTag};
 use serde::{Deserialize, Serialize};
 
 /// Plies without a capture after which the game is declared a draw
@@ -17,6 +17,15 @@ pub enum DrawReason {
     NoCapture,
 }
 
+/// Why a repeated position is a loss under CCA / Asian rules.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RepKind {
+    /// 长将: the losing side gave check on every move of the repeating cycle.
+    Check,
+    /// 长捉: the losing side chased (threatened to win material) every move.
+    Chase,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum GameStatus {
     Ongoing,
@@ -24,6 +33,9 @@ pub enum GameStatus {
     Win(Color),         // checkmate: `Color` wins
     Stalemate(Color),   // no legal move (not in check) -> `Color` wins (Xiangqi rule)
     Draw(DrawReason),
+    /// Perpetual check / chase: the offending side loses; `winner` is the
+    /// other side. CCA / Asian repetition rule.
+    PerpetualLoss { winner: Color, kind: RepKind },
 }
 
 #[derive(Clone)]
@@ -72,6 +84,20 @@ impl GameState {
             log: Vec::new(),
             last_move: None,
             hashes: vec![position_hash(&board, Color::Red)],
+        }
+    }
+
+    /// Build a state from a hand-placed board with the repetition `hashes`
+    /// seeded to this position (so threefold detection works). Test-only.
+    #[cfg(test)]
+    pub fn with_position(board: Board, side: Color) -> Self {
+        GameState {
+            board,
+            side_to_move: side,
+            history: Vec::new(),
+            log: Vec::new(),
+            last_move: None,
+            hashes: vec![position_hash(&board, side)],
         }
     }
 
@@ -124,11 +150,91 @@ impl GameState {
         }
     }
 
-    /// Current game status.
+    /// CCA / Asian repetition judgment for the just-repeated position. Looks
+    /// at the most recent identical position, treats the moves in between as
+    /// one repeating cycle, classifies each side's contribution to it
+    /// (perpetual check / perpetual chase / idle) via [`tag_move`], and
+    /// applies the rule table:
     ///
-    /// Simplification: threefold repetition is scored as a draw. Full Xiangqi
-    /// rules instead punish *perpetual check / chase* as a loss for the
-    /// offending side; that nuance is intentionally not enforced here.
+    /// - exactly one side offends (长将 or 长捉), the other idle -> offender loses;
+    /// - 一将一捉 (one perpetual-checks, the other perpetual-chases) -> the
+    ///   perpetual-checking side loses (长将 is the heavier offence);
+    /// - both 长将, or both 长捉, or both idle (a plain positional repetition)
+    ///   -> draw.
+    ///
+    /// The cycle is capture-free (otherwise the position could not recur), so
+    /// the chase test's material reasoning is well-defined.
+    fn repetition_judgment(&self) -> GameStatus {
+        let draw = GameStatus::Draw(DrawReason::Repetition);
+        let last = self.history.len(); // hashes[last] == current position
+        let cur = self.hashes[last];
+        let Some(j) = (0..last).rev().find(|&k| self.hashes[k] == cur) else {
+            return draw;
+        };
+
+        // Rewind a copy to the cycle's start, then replay it tagging moves.
+        let mut board = self.board;
+        for (mv, cap) in self.history[j..last].iter().rev() {
+            board.unmake(*mv, *cap);
+        }
+
+        // Per side: total moves, all-check?, all-aggressive?, any chase?
+        let mut agg = [[0u32; 4]; 2]; // [side][moves, checks, aggr, chases]
+        for i in j..last {
+            // Derive the mover of move `i` from the current side to move
+            // (robust to who started): same side as now when `last - i` is
+            // even, the other side when odd.
+            let mover = if (last - i).is_multiple_of(2) {
+                self.side_to_move
+            } else {
+                self.side_to_move.opposite()
+            };
+            let mv = self.history[i].0;
+            let a = &mut agg[(mover == Color::Black) as usize];
+            a[0] += 1;
+            match tag_move(&board, mv, mover) {
+                MoveTag::Check => {
+                    a[1] += 1;
+                    a[2] += 1;
+                }
+                MoveTag::Chase => {
+                    a[2] += 1;
+                    a[3] += 1;
+                }
+                MoveTag::Idle => {}
+            }
+            board.make(mv);
+        }
+
+        // Offence level: 2 = 长将 (every move a check), 1 = 长捉 (every move
+        // aggressive with at least one chase), 0 = idle.
+        let level = |a: &[u32; 4]| -> (u8, RepKind) {
+            if a[0] > 0 && a[1] == a[0] {
+                (2, RepKind::Check)
+            } else if a[0] > 0 && a[2] == a[0] && a[3] > 0 {
+                (1, RepKind::Chase)
+            } else {
+                (0, RepKind::Chase)
+            }
+        };
+        let (rl, rk) = level(&agg[0]); // Red
+        let (bl, bk) = level(&agg[1]); // Black
+        let red_loses = GameStatus::PerpetualLoss { winner: Color::Black, kind: rk };
+        let black_loses = GameStatus::PerpetualLoss { winner: Color::Red, kind: bk };
+        match (rl, bl) {
+            (0, 0) | (2, 2) | (1, 1) => draw,
+            (_, 0) => red_loses,
+            (0, _) => black_loses,
+            // 一将一捉: the perpetual-checking side (level 2) loses.
+            (2, 1) => GameStatus::PerpetualLoss { winner: Color::Black, kind: RepKind::Check },
+            (1, 2) => GameStatus::PerpetualLoss { winner: Color::Red, kind: RepKind::Check },
+            _ => draw,
+        }
+    }
+
+    /// Current game status. Threefold repetition is judged by the CCA / Asian
+    /// rules (see [`Self::repetition_judgment`]): perpetual check / chase is a
+    /// loss for the offending side; only a mutual or idle repetition draws.
     pub fn status(&mut self) -> GameStatus {
         let side = self.side_to_move;
         let has_move = !self.legal_moves().is_empty();
@@ -143,7 +249,7 @@ impl GameState {
             };
         }
         if self.repetition_count() >= 3 {
-            return GameStatus::Draw(DrawReason::Repetition);
+            return self.repetition_judgment();
         }
         if self.plies_since_capture() >= NO_CAPTURE_PLY_LIMIT {
             return GameStatus::Draw(DrawReason::NoCapture);
