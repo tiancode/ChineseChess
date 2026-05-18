@@ -234,6 +234,11 @@ pub struct SearchEngine {
     /// check? Used to score a repetition reached by perpetual check (长将)
     /// as a loss for the checking side, instead of a flat draw.
     path_check: Vec<bool>,
+    /// Set by `search` on return to signal that the value just produced
+    /// depended on the *path* (a repetition score), not the position alone.
+    /// Such values must not be cached in the position-keyed TT, or they would
+    /// be served for a different path (graph-history interaction).
+    path_dep: bool,
 }
 
 impl SearchEngine {
@@ -255,6 +260,7 @@ impl SearchEngine {
             game_counts: HashMap::new(),
             path: Vec::with_capacity(MAX_PLY),
             path_check: Vec::with_capacity(MAX_PLY),
+            path_dep: false,
         }
     }
 
@@ -268,6 +274,23 @@ impl SearchEngine {
     #[cfg(test)]
     pub fn nodes_searched(&self) -> u64 {
         self.nodes
+    }
+
+    /// Drive [`Self::repetition_score`] with a synthetic search path so the
+    /// (intricate) cycle parity logic can be unit-tested deterministically
+    /// without reaching a real perpetual inside the search.
+    #[cfg(test)]
+    pub fn repetition_score_probe(
+        &mut self,
+        path: &[u64],
+        path_check: &[bool],
+        key: u64,
+        ply: usize,
+        here_check: bool,
+    ) -> i32 {
+        self.path = path.to_vec();
+        self.path_check = path_check.to_vec();
+        self.repetition_score(key, ply, here_check)
     }
 
     fn next_rand(&mut self) -> u64 {
@@ -430,6 +453,7 @@ impl SearchEngine {
     ) -> i32 {
         self.nodes += 1;
         if self.time_up() {
+            self.path_dep = false;
             return 0;
         }
 
@@ -448,9 +472,14 @@ impl SearchEngine {
             let in_game = self.game_counts.get(&key).copied().unwrap_or(0) as usize;
             let in_path = self.path.iter().filter(|&&k| k == key).count();
             if in_game + in_path >= 2 {
+                self.path_dep = true; // a repetition score is path-dependent
                 return self.repetition_score(key, ply, here_check);
             }
         }
+        // Default for every non-repetition return below (TT hit, quiescence,
+        // mate). The normal-completion path overwrites this with the
+        // subtree's aggregate flag.
+        self.path_dep = false;
 
         let alpha_orig = alpha;
         if let Some(e) = self.tt.probe(key) {
@@ -488,6 +517,10 @@ impl SearchEngine {
         let mut best_score = -INF;
         let mut best_move = None;
         let mut first = true;
+        // OR of every searched child's path-dependence flag. If set, this
+        // node's value was influenced by a repetition score and must not be
+        // cached in the position-keyed TT.
+        let mut subtree_dep = false;
 
         for mv in moves {
             let captured = board.make(mv);
@@ -511,10 +544,13 @@ impl SearchEngine {
             };
             board.unmake(mv, captured);
             first = false;
+            // The child set `self.path_dep` on return; fold it in.
+            subtree_dep |= self.path_dep;
 
             if self.aborted {
                 self.path.pop();
                 self.path_check.pop();
+                self.path_dep = false;
                 return 0;
             }
             if score > best_score {
@@ -546,8 +582,13 @@ impl SearchEngine {
         } else {
             Bound::Exact
         };
-        self.tt
-            .store(key, depth, adjust_to_tt(best_score, ply), bound, best_move);
+        // A repetition-influenced value is path-dependent: never cache it in
+        // the position-keyed TT (it would be served on a different path).
+        if !subtree_dep {
+            self.tt
+                .store(key, depth, adjust_to_tt(best_score, ply), bound, best_move);
+        }
+        self.path_dep = subtree_dep;
         best_score
     }
 }
@@ -615,12 +656,14 @@ impl Engine for SearchEngine {
             let mut local_best = moves[0];
             let mut scored: Vec<(Move, i32)> = Vec::with_capacity(moves.len());
             let mut completed = true;
+            let mut root_dep = false; // any root line influenced by repetition?
 
             for mv in moves.iter() {
                 let captured = root_board.make(*mv);
                 let score =
                     -self.search(&mut root_board, side.opposite(), depth - 1, -INF, INF, 1);
                 root_board.unmake(*mv, captured);
+                root_dep |= self.path_dep;
 
                 if self.aborted {
                     completed = false;
@@ -653,8 +696,10 @@ impl Engine for SearchEngine {
                 if best_pool.is_empty() {
                     best_pool = vec![local_best];
                 }
-                self.tt
-                    .store(key, depth, best_score, Bound::Exact, Some(local_best));
+                if !root_dep {
+                    self.tt
+                        .store(key, depth, best_score, Bound::Exact, Some(local_best));
+                }
             } else {
                 break; // ran out of time; keep the last completed depth
             }

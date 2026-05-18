@@ -7,7 +7,7 @@
 use crate::ai::search::SearchEngine;
 use crate::ai::{make_engine, Engine, EngineKind};
 use crate::board::*;
-use crate::game::{DrawReason, GameState, GameStatus, RepKind};
+use crate::game::{repetition_status, DrawReason, GameState, GameStatus, RepKind};
 use crate::moves::{generals_face, in_check, legal_moves, tag_move, MoveTag};
 
 fn place(b: &mut Board, f: i32, r: i32, kind: PieceKind, color: Color) {
@@ -279,6 +279,60 @@ fn defended_chase_is_a_draw() {
         }
     }
     assert_eq!(g.status(), GameStatus::Draw(DrawReason::Repetition));
+}
+
+#[test]
+fn repetition_decision_table_all_arms() {
+    use Color::{Black, Red};
+    let draw = GameStatus::Draw(DrawReason::Repetition);
+    let chk = RepKind::Check;
+    let cha = RepKind::Chase;
+    let loss = |w, k| GameStatus::PerpetualLoss { winner: w, kind: k };
+
+    // Both idle, or both committing the same offence -> draw.
+    assert_eq!(repetition_status(0, cha, 0, cha), draw);
+    assert_eq!(repetition_status(2, chk, 2, chk), draw);
+    assert_eq!(repetition_status(1, cha, 1, cha), draw);
+    // Exactly one side offends, the other idle -> offender loses.
+    assert_eq!(repetition_status(2, chk, 0, cha), loss(Black, chk)); // Red 长将
+    assert_eq!(repetition_status(1, cha, 0, cha), loss(Black, cha)); // Red 长捉
+    assert_eq!(repetition_status(0, cha, 2, chk), loss(Red, chk)); // Black 长将
+    assert_eq!(repetition_status(0, cha, 1, cha), loss(Red, cha)); // Black 长捉
+    // 一将一捉: the perpetual-checking side loses (长将 is heavier).
+    assert_eq!(repetition_status(2, chk, 1, cha), loss(Black, chk)); // Red checks
+    assert_eq!(repetition_status(1, cha, 2, chk), loss(Red, chk)); // Black checks
+}
+
+#[test]
+fn repetition_score_parity() {
+    // Synthetic 4-ply cycle: path[0] is the repeating key K. The cycle moves
+    // (by parity) split into the side-to-move's moves and the opponent's;
+    // `repetition_score` must rule perpetual check for whichever side checks
+    // on *all* of its cycle moves.
+    let k = 42u64;
+    let path = [k, 7, 8, 9];
+    let mut e = SearchEngine::fixed_depth(1);
+    let ply = 5;
+
+    // self (side to move) checks every one of its cycle moves, opponent not.
+    let s = e.repetition_score_probe(&path, &[false, true, false, true], k, ply, true);
+    assert!(s < -20_000, "side perpetually checks -> it loses: {s}");
+
+    // opponent checks every one of its moves, self not.
+    let s = e.repetition_score_probe(&path, &[false, false, true, false], k, ply, true);
+    assert!(s > 20_000, "opponent perpetually checks -> we win: {s}");
+
+    // mutual perpetual check -> draw.
+    let s = e.repetition_score_probe(&path, &[false, true, true, true], k, ply, true);
+    assert_eq!(s, 0, "mutual perpetual check is a draw");
+
+    // no side checks throughout -> not perpetual check -> draw (0).
+    let s = e.repetition_score_probe(&path, &[false, false, false, false], k, ply, false);
+    assert_eq!(s, 0, "no perpetual check -> draw");
+
+    // Repetition formed off-path (key absent from path) -> draw fallback.
+    let s = e.repetition_score_probe(&[1, 2, 3], &[false, false, false], 99, ply, true);
+    assert_eq!(s, 0, "off-path repetition falls back to draw");
 }
 
 #[test]

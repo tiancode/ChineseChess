@@ -38,6 +38,26 @@ pub enum GameStatus {
     PerpetualLoss { winner: Color, kind: RepKind },
 }
 
+/// Apply the CCA repetition decision table to each side's offence level
+/// (`2` = 长将 / perpetual check, `1` = 长捉 / perpetual chase, `0` = idle)
+/// and its kind. Pure, so every arm is unit-testable without constructing a
+/// position. The winner colours are fixed (Red is side 0, Black side 1).
+pub(crate) fn repetition_status(rl: u8, rk: RepKind, bl: u8, bk: RepKind) -> GameStatus {
+    let draw = GameStatus::Draw(DrawReason::Repetition);
+    match (rl, bl) {
+        // Both idle (plain positional repetition), or both committing the
+        // same offence -> a legitimate draw.
+        (0, 0) | (2, 2) | (1, 1) => draw,
+        // Exactly one side offends, the other is idle -> offender loses.
+        (_, 0) => GameStatus::PerpetualLoss { winner: Color::Black, kind: rk },
+        (0, _) => GameStatus::PerpetualLoss { winner: Color::Red, kind: bk },
+        // 一将一捉: the perpetual-checking side (level 2) loses.
+        (2, 1) => GameStatus::PerpetualLoss { winner: Color::Black, kind: RepKind::Check },
+        (1, 2) => GameStatus::PerpetualLoss { winner: Color::Red, kind: RepKind::Check },
+        _ => draw,
+    }
+}
+
 #[derive(Clone)]
 pub struct GameState {
     pub board: Board,
@@ -219,17 +239,7 @@ impl GameState {
         };
         let (rl, rk) = level(&agg[0]); // Red
         let (bl, bk) = level(&agg[1]); // Black
-        let red_loses = GameStatus::PerpetualLoss { winner: Color::Black, kind: rk };
-        let black_loses = GameStatus::PerpetualLoss { winner: Color::Red, kind: bk };
-        match (rl, bl) {
-            (0, 0) | (2, 2) | (1, 1) => draw,
-            (_, 0) => red_loses,
-            (0, _) => black_loses,
-            // 一将一捉: the perpetual-checking side (level 2) loses.
-            (2, 1) => GameStatus::PerpetualLoss { winner: Color::Black, kind: RepKind::Check },
-            (1, 2) => GameStatus::PerpetualLoss { winner: Color::Red, kind: RepKind::Check },
-            _ => draw,
-        }
+        repetition_status(rl, rk, bl, bk)
     }
 
     /// Current game status. Threefold repetition is judged by the CCA / Asian
