@@ -32,8 +32,11 @@ agree with the Rust engine's published perft values (44 / 1 920 / 79 666).
   orchestrated by `pipeline.py`.
 
 Terminal scoring follows the Rust engine exactly: a side with no legal reply
-*loses* (mate or stalemate); threefold repetition and the 120-ply no-capture
-rule are draws.
+*loses* (mate or stalemate); repetition is judged by the **CCA / Asian
+rules** — a one-sided perpetual check (长将) or chase (长捉) *loses* for the
+offender, and only a mutual or plain idle repetition draws (`game.py::
+_repetition_judgment`, a mirror of `game.rs::repetition_judgment`); the
+120-ply no-capture rule is a draw.
 
 ## Setup
 
@@ -57,6 +60,25 @@ python -m alphazero.pipeline --iterations 200 --sims 400 --games_per_iter 80
 # 3. play / watch a checkpoint
 python -m alphazero.play --ckpt alphazero/checkpoints/best.pt --watch
 python -m alphazero.play --ckpt alphazero/checkpoints/best.pt --human red
+
+# 4. real run detached, logging to a file (a full run takes hours):
+mkdir -p alphazero/checkpoints
+nohup setsid python -m alphazero.pipeline \
+  --iterations 40 --games_per_iter 18 --sims 128 \
+  --channels 128 --res_blocks 10 --max_game_len 200 \
+  --train_steps_per_iter 300 --batch_size 256 \
+  --arena_games 8 --arena_sims 64 --seed 0 \
+  > alphazero/checkpoints/train.log 2>&1 &
+
+# resume from a checkpoint — the config must match the original run;
+# write to a different log file so history is not overwritten:
+nohup setsid python -m alphazero.pipeline \
+  --resume alphazero/checkpoints/best.pt \
+  --iterations 40 --games_per_iter 18 --sims 128 \
+  --channels 128 --res_blocks 10 --max_game_len 200 \
+  --train_steps_per_iter 300 --batch_size 256 \
+  --arena_games 8 --arena_sims 64 --seed 0 \
+  >> alphazero/checkpoints/train_resume.log 2>&1 &
 ```
 
 Checkpoints land in `alphazero/checkpoints/` (`best.pt` is the latest
@@ -85,6 +107,37 @@ The per-iteration `resign:` log line reports it.
 
 `Config.smoke()` shrinks everything for the `--smoke` run.
 
+## Monitoring a run
+
+```bash
+tail -f alphazero/checkpoints/train.log   # live progress
+pgrep -af alphazero.pipeline              # is it running? PID?
+pkill -f alphazero.pipeline               # stop training
+nvidia-smi                                # GPU utilisation
+```
+
+## Reading the logs
+
+Each iteration prints two lines, plus a third when the candidate passes the
+arena gate:
+
+```
+[iter   3] R/B/D=8/7/3 samples=2310 buf=6840 | loss=2.10 (p=1.78 v=0.32) | sp=820s tr=140s
+           resign: no-resign games=2 would-resign=1 fp=0 rate=0.00 thr=-0.92
+           candidate PROMOTED (score 0.62) -> alphazero/checkpoints/best_iter003.pt
+```
+
+- `R/B/D` — self-play results this iteration (Red wins / Black wins / draws).
+- `samples` / `buf` — new training samples this iteration / replay-buffer size.
+- `loss` — total, with policy (`p`) and value (`v`) components.
+- `sp` / `tr` — wall-clock seconds spent on self-play / training.
+- `resign:` — resignation false-positive accounting (see Tuning).
+
+**Healthy signals:** `loss` trending down overall; `v` rising from ~0 then
+falling again (the net starts predicting winners instead of all-draws);
+`R/B/D` showing decisive games with Red and Black roughly balanced; `fp rate`
+holding near `resign_target_fp`.
+
 ## Expectations / honest caveats
 
 This is a faithful, runnable implementation of the *algorithm*, not a
@@ -96,57 +149,12 @@ hours, but reaching the strength of the Rust alpha-beta engine in `src/ai`
 would take a long, sustained run. The knobs above let you trade strength for
 wall-clock time.
 
+As a concrete anchor, on a single 4 GB laptop GPU (e.g. RTX 3050 Ti) with the
+pure-Python self-play layer, ~18 games + 300 train steps + a light arena runs
+≈ 20–30 min per iteration (early games are fast, ~40 s each, since they reach
+a decisive result quickly), so a 40-iteration run is ≈ 13–20 h. `--sims`
+dominates both strength and wall-clock cost.
+
 Possible speedups (not implemented, to keep the code readable): leaf-batched
 MCTS, multiprocess self-play workers, a compact (~2 000) move-label action
 space, and a Cython/Rust rules binding.
-
-
-
-  1. 启动正式训练(后台、分离、日志落盘)
-  mkdir -p alphazero/checkpoints
-  nohup setsid python3 -m alphazero.pipeline \
-    --iterations 40 --games_per_iter 18 --sims 128 \
-    --channels 128 --res_blocks 10 --max_game_len 200 \
-    --train_steps_per_iter 300 --batch_size 256 \ 
-    --arena_games 8 --arena_sims 64 --seed 0 \
-    > alphazero/checkpoints/train.log 2>&1 &
-    
-    恢复训练命令(配置必须与原来一致,日志换个名避免覆盖历史):
-  nohup setsid python3 -m alphazero.pipeline \
-    --resume alphazero/checkpoints/best.pt \ 
-    --iterations 40 --games_per_iter 18 --sims 128 \
-    --channels 128 --res_blocks 10 --max_game_len 200 \
-    --train_steps_per_iter 300 --batch_size 256 \ 
-    --arena_games 8 --arena_sims 64 --seed 0 \
-    >> alphazero/checkpoints/train_resume.log 2>&1 &
-
-
-  2. 实时看进度
-  tail -f alphazero/checkpoints/train.log
-  
-  3. 查进程 / 停止
-  pgrep -af alphazero.pipeline      # 看是否在跑、PID
-  pkill -f alphazero.pipeline       # 停止训练
-  nvidia-smi                        # 看 GPU 占用
-  
-  预期(基于刚才实测)
-
-  - 实测 ~42s/局(早期对局快速分胜负,非最坏情况)。
-  - 粗估每迭代:自对弈 18 局 ≈ 13–18 min + 训练 300 步几分钟 + 轻量 arena 几分钟 ≈ ~20–30 min/迭代;40 迭代约 13–20 小时。这是单笔记本
-  GPU(3050 Ti 4GB)+ 纯 Python 自对弈的现实开销。
-  - 想更快看到信号:调小 --games_per_iter 或 --iterations;想更强:调大 --sims(最影响棋力,也最影响速度)。
-  - checkpoint 落在 alphazero/checkpoints/best.pt 是 arena 闸门晋级的最新网络;随时可 python3 -m alphazero.play --ckpt 
-  alphazero/checkpoints/best.pt --watch 观战。
-
-  日志怎么读
-  
-  每迭代两行(及晋级行):
-  [iter   3] R/B/D=8/7/3 samples=2310 buf=6840 | loss=2.10 (p=1.78 v=0.32) | sp=820s tr=140s
-             resign: no-resign games=2 would-resign=1 fp=0 rate=0.00 thr=-0.92
-             candidate PROMOTED (score 0.62) -> alphazero/checkpoints/best_iter003.pt
-  健康信号:loss 总体下降、v(价值损失)从~0 升起再回落(开始学胜负而非全和)、R/B/D 出现非和棋且红黑大致均衡、fp rate 维持在 resign_target_fp
-  附近。
-  
-  我不在你那个会话里看不到日志——跑起来后把几行 [iter …] 贴回来,我帮你判断是否健康、要不要调参。需要我把这条命令也写成一个 run_train.sh
-  脚本吗?
-
