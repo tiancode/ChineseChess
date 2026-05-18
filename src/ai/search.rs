@@ -19,6 +19,15 @@ const MATE: i32 = 30_000;
 const MATE_THRESHOLD: i32 = MATE - 256;
 const MAX_PLY: usize = 64;
 
+/// Plies (half-moves) into the game that still count as "opening". While the
+/// game history is shorter than this, the root widens its equal-best pool so
+/// games do not always start with the identical line.
+const OPENING_PLIES: usize = 8;
+/// In the opening, any root move scoring within this many centipawns of the
+/// best joins the random-pick pool (a soldier is worth 100). Picked moves are
+/// near-best, so play stays sound; afterwards an exact tie is required.
+const OPENING_MARGIN: i32 = 80;
+
 // ----------------------------------------------------------------------------
 // Zobrist hashing (full recompute per node: O(90), simple and bug-free).
 // ----------------------------------------------------------------------------
@@ -558,7 +567,7 @@ impl Engine for SearchEngine {
             // Alpha-beta + PVS still prune inside the deep interior search.
             let mut best_score = -INF;
             let mut local_best = moves[0];
-            let mut pool: Vec<Move> = Vec::new();
+            let mut scored: Vec<(Move, i32)> = Vec::with_capacity(moves.len());
             let mut completed = true;
 
             for mv in moves.iter() {
@@ -574,16 +583,30 @@ impl Engine for SearchEngine {
                 if score > best_score {
                     best_score = score;
                     local_best = *mv;
-                    pool.clear();
-                    pool.push(*mv);
-                } else if score == best_score {
-                    pool.push(*mv);
                 }
+                scored.push((*mv, score));
             }
 
             if completed {
                 best = local_best;
-                best_pool = if pool.is_empty() { vec![local_best] } else { pool };
+                // Equally-best moves give natural variety. In the opening,
+                // widen the pool to every move within `OPENING_MARGIN` of the
+                // best (near-best, so still sound) so games don't always start
+                // identically; afterwards require an exact tie, leaving normal
+                // play strength unchanged.
+                let cutoff = if state.history.len() < OPENING_PLIES {
+                    best_score - OPENING_MARGIN
+                } else {
+                    best_score
+                };
+                best_pool = scored
+                    .iter()
+                    .filter(|(_, s)| *s >= cutoff)
+                    .map(|(m, _)| *m)
+                    .collect();
+                if best_pool.is_empty() {
+                    best_pool = vec![local_best];
+                }
                 self.tt
                     .store(key, depth, best_score, Bound::Exact, Some(local_best));
             } else {
