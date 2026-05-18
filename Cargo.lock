@@ -614,6 +614,7 @@ dependencies = [
 name = "chinese_chess"
 version = "0.1.0"
 dependencies = [
+ "ab_glyph",
  "eframe",
  "serde",
  "serde_json",

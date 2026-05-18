@@ -10,8 +10,14 @@ use crate::ai::{make_engine, Engine};
 use crate::board::*;
 use crate::game::{DrawReason, GameState, GameStatus, SaveGame};
 
-const MARGIN: f32 = 38.0;
-const CELL: f32 = 60.0;
+/// Blank frame around the board, in points.
+const MARGIN: f32 = 36.0;
+/// Breathing room kept above and below the board so it does not touch the
+/// window edges when maximised.
+const OUTER_MARGIN: f32 = 14.0;
+/// Minimum cell size: the board scales freely with the window (filling the
+/// space when maximised) but never shrinks below this on a small window.
+const CELL_MIN: f32 = 26.0;
 
 /// Board coord -> on-screen cell indices, accounting for board flip
 /// (the human side always sits at the bottom).
@@ -365,7 +371,7 @@ impl XiangqiApp {
 
                 let mut st = egui::RichText::new(self.status_text()).strong();
                 if self.game_over() {
-                    st = st.size(20.0).color(egui::Color32::from_rgb(0xC0, 0x2A, 0x1B));
+                    st = st.size(20.0).color(super::PIECE_RED);
                 }
                 ui.label(st);
                 ui.add_space(6.0);
@@ -426,11 +432,30 @@ impl XiangqiApp {
     }
 
     fn draw_board(&mut self, ui: &mut egui::Ui) {
-        let board_w = (FILES as f32 - 1.0) * CELL + 2.0 * MARGIN;
-        let board_h = (RANKS as f32 - 1.0) * CELL + 2.0 * MARGIN;
+        // Take the whole panel and size the board to fit it, so the board
+        // grows when the window is maximised and shrinks (to a floor) when
+        // it is small. `cell` is derived from the *allocated* rect rather
+        // than a pre-query, which keeps the board strictly inside the
+        // visible region (available_size() can over-report and would
+        // otherwise let a maximised board spill off-window).
         let (response, painter) =
-            ui.allocate_painter(egui::vec2(board_w, board_h), egui::Sense::click());
-        let rect = response.rect;
+            ui.allocate_painter(ui.available_size(), egui::Sense::click());
+        let area = response.rect;
+        let (cols, rows) = (FILES as f32 - 1.0, RANKS as f32 - 1.0);
+        let cell = ((area.width() - 2.0 * MARGIN) / cols)
+            .min((area.height() - 2.0 * MARGIN - 2.0 * OUTER_MARGIN) / rows)
+            .max(CELL_MIN);
+
+        let board_w = cols * cell + 2.0 * MARGIN;
+        let board_h = rows * cell + 2.0 * MARGIN;
+
+        // Centre the board within the allocated area.
+        let board_min = area.min
+            + egui::vec2(
+                ((area.width() - board_w) * 0.5).max(0.0),
+                ((area.height() - board_h) * 0.5).max(0.0),
+            );
+        let rect = egui::Rect::from_min_size(board_min, egui::vec2(board_w, board_h));
         let origin = rect.min + egui::vec2(MARGIN, MARGIN);
 
         // When the human plays Black the board is flipped so their pieces sit
@@ -440,16 +465,17 @@ impl XiangqiApp {
         let cjk = self.cjk_ok;
         let point = |f: i32, r: i32| -> egui::Pos2 {
             let (sf, sr) = to_screen(flip, f, r);
-            egui::pos2(origin.x + sf as f32 * CELL, origin.y + sr as f32 * CELL)
+            egui::pos2(origin.x + sf as f32 * cell, origin.y + sr as f32 * cell)
         };
 
         // Colors.
         let bg = egui::Color32::from_rgb(0xEC, 0xCF, 0x93);
         let line = egui::Color32::from_rgb(0x5A, 0x3A, 0x1E);
-        let disc = egui::Color32::from_rgb(0xF7, 0xE7, 0xC1);
-        let red = egui::Color32::from_rgb(0xC0, 0x2A, 0x1B);
+        let disc = super::PIECE_CREAM;
+        let red = super::PIECE_RED;
         let black = egui::Color32::from_rgb(0x20, 0x20, 0x20);
         let sel_col = egui::Color32::from_rgb(0x1E, 0x88, 0xE5);
+        let moved_col = egui::Color32::from_rgb(0xE6, 0xA2, 0x17);
         let dot_col = egui::Color32::from_rgba_unmultiplied(0x1E, 0x88, 0xE5, 170);
         let last_col = egui::Color32::from_rgba_unmultiplied(0xF1, 0xC4, 0x0F, 90);
         let check_col = egui::Color32::from_rgba_unmultiplied(0xE7, 0x4C, 0x3C, 110);
@@ -482,14 +508,14 @@ impl XiangqiApp {
                 egui::pos2(point(1, 0).x, river_y),
                 egui::Align2::CENTER_CENTER,
                 "楚 河",
-                egui::FontId::proportional(26.0),
+                egui::FontId::proportional(cell * 0.44),
                 line,
             );
             painter.text(
                 egui::pos2(point(7, 0).x, river_y),
                 egui::Align2::CENTER_CENTER,
                 "漢 界",
-                egui::FontId::proportional(26.0),
+                egui::FontId::proportional(cell * 0.44),
                 line,
             );
         } else {
@@ -497,28 +523,30 @@ impl XiangqiApp {
                 egui::pos2(point(4, 0).x, river_y),
                 egui::Align2::CENTER_CENTER,
                 "R I V E R",
-                egui::FontId::proportional(24.0),
+                egui::FontId::proportional(cell * 0.40),
                 line,
             );
             painter.text(
                 egui::pos2(rect.center().x, rect.min.y + 12.0),
                 egui::Align2::CENTER_CENTER,
                 "No CJK font: pieces shown as letters (K/A/E/H/R/C/P)",
-                egui::FontId::proportional(13.0),
+                egui::FontId::proportional((cell * 0.22).max(11.0)),
                 egui::Color32::from_rgb(0xB0, 0x30, 0x20),
             );
         }
 
         // Coordinate labels, anchored to the screen edges so they stay
         // readable whether or not the board is flipped.
+        let label_size = (cell * 0.27).max(11.0);
+        let label_off = cell * 0.37;
         let bottom_r = if flip { 0 } else { 9 };
         for f in 0..FILES as i32 {
             let p = point(f, bottom_r);
             painter.text(
-                egui::pos2(p.x, p.y + 22.0),
+                egui::pos2(p.x, p.y + label_off),
                 egui::Align2::CENTER_CENTER,
                 (b'A' + f as u8) as char,
-                egui::FontId::proportional(16.0),
+                egui::FontId::proportional(label_size),
                 line,
             );
         }
@@ -526,19 +554,19 @@ impl XiangqiApp {
         for r in 0..RANKS as i32 {
             let p = point(left_f, r);
             painter.text(
-                egui::pos2(p.x - 22.0, p.y),
+                egui::pos2(p.x - label_off, p.y),
                 egui::Align2::CENTER_CENTER,
                 format!("{}", RANKS as i32 - r),
-                egui::FontId::proportional(16.0),
+                egui::FontId::proportional(label_size),
                 line,
             );
         }
 
-        // Last-move highlight.
+        // Last-move highlight (faint trail discs on the from/to squares).
         if let Some(mv) = self.game.last_move {
             for sq in [mv.from, mv.to] {
                 let c = point(file_of(sq), rank_of(sq));
-                painter.circle_filled(c, CELL * 0.46, last_col);
+                painter.circle_filled(c, cell * 0.46, last_col);
             }
         }
 
@@ -546,11 +574,12 @@ impl XiangqiApp {
         if let GameStatus::Check(c) = self.eff_status() {
             if let Some(g) = self.game.board.find_general(c) {
                 let p = point(file_of(g), rank_of(g));
-                painter.circle_filled(p, CELL * 0.48, check_col);
+                painter.circle_filled(p, cell * 0.48, check_col);
             }
         }
 
         let targets = self.legal_targets();
+        let moved_to = self.game.last_move.map(|m| m.to);
 
         // Pieces.
         for i in 0..CELLS {
@@ -559,16 +588,20 @@ impl XiangqiApp {
             };
             let c = point(file_of(i), rank_of(i));
             let pc = if piece.color == Color::Red { red } else { black };
-            painter.circle_filled(c, CELL * 0.42, disc);
-            painter.circle_stroke(c, CELL * 0.42, egui::Stroke::new(2.0, pc));
+            painter.circle_filled(c, cell * 0.42, disc);
+            painter.circle_stroke(c, cell * 0.42, egui::Stroke::new(2.0, pc));
+            // Ring the piece that just moved so the last move is easy to spot.
+            if moved_to == Some(i) {
+                painter.circle_stroke(c, cell * 0.5, egui::Stroke::new(3.0, moved_col));
+            }
             if self.selected == Some(i) {
-                painter.circle_stroke(c, CELL * 0.46, egui::Stroke::new(3.0, sel_col));
+                painter.circle_stroke(c, cell * 0.46, egui::Stroke::new(3.0, sel_col));
             }
             painter.text(
                 c,
                 egui::Align2::CENTER_CENTER,
                 if cjk { piece.glyph() } else { piece.ascii() },
-                egui::FontId::proportional(if cjk { 30.0 } else { 26.0 }),
+                egui::FontId::proportional(if cjk { cell * 0.5 } else { cell * 0.43 }),
                 pc,
             );
         }
@@ -577,24 +610,24 @@ impl XiangqiApp {
         for &t in &targets {
             let c = point(file_of(t), rank_of(t));
             if self.game.board.get(t).is_some() {
-                painter.circle_stroke(c, CELL * 0.46, egui::Stroke::new(3.0, dot_col));
+                painter.circle_stroke(c, cell * 0.46, egui::Stroke::new(3.0, dot_col));
             } else {
-                painter.circle_filled(c, 7.0, dot_col);
+                painter.circle_filled(c, (cell * 0.12).max(4.0), dot_col);
             }
         }
 
         // Click -> nearest on-screen intersection.
         if response.clicked() {
             if let Some(pos) = response.interact_pointer_pos() {
-                let sff = ((pos.x - origin.x) / CELL).round();
-                let srr = ((pos.y - origin.y) / CELL).round();
+                let sff = ((pos.x - origin.x) / cell).round();
+                let srr = ((pos.y - origin.y) / cell).round();
                 if (0.0..FILES as f32).contains(&sff) && (0.0..RANKS as f32).contains(&srr) {
                     let (sf, sr) = (sff as i32, srr as i32);
-                    let cell = egui::pos2(
-                        origin.x + sf as f32 * CELL,
-                        origin.y + sr as f32 * CELL,
+                    let cell_pt = egui::pos2(
+                        origin.x + sf as f32 * cell,
+                        origin.y + sr as f32 * cell,
                     );
-                    if cell.distance(pos) <= CELL * 0.5 {
+                    if cell_pt.distance(pos) <= cell * 0.5 {
                         self.handle_screen_click(sf, sr);
                     }
                 }
