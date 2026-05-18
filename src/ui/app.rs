@@ -29,6 +29,45 @@ const OUTER_MARGIN: f32 = 14.0;
 /// space when maximised) but never shrinks below this on a small window.
 const CELL_MIN: f32 = 26.0;
 
+/// Seconds the piece spends sliding from its origin to its destination.
+const ANIM_SLIDE: f64 = 0.20;
+/// Total move-animation lifetime: the slide plus the landing pulse tail.
+const ANIM_TOTAL: f64 = 0.5;
+
+/// An in-flight move animation: which move, and when (egui clock seconds) it
+/// began. The board is already in the post-move state; this only drives the
+/// transient slide + landing-pulse overlay.
+#[derive(Debug, Clone, Copy)]
+struct MoveAnim {
+    mv: Move,
+    start: f64,
+}
+
+/// Ease-out cubic: fast start, gentle settle. `p` is clamped to `[0, 1]`.
+fn ease_out_cubic(p: f32) -> f32 {
+    let p = p.clamp(0.0, 1.0);
+    1.0 - (1.0 - p).powi(3)
+}
+
+/// Decide whether a just-applied move should trigger the slide + drop sound,
+/// and whether it was a capture. Returns `None` when `history` has not grown
+/// past `anim_ply` (a reset or an idle frame), so the caller falls through
+/// silently. Pure, so the trigger logic is unit-testable without an egui ctx.
+fn move_fx(
+    history: &[(Move, Option<Piece>)],
+    last_move: Option<Move>,
+    anim_ply: usize,
+) -> Option<(Move, bool)> {
+    if history.len() <= anim_ply {
+        return None;
+    }
+    let mv = last_move?;
+    // The newest history entry carries the captured piece (if any) and lines
+    // up with `last_move`.
+    let captured = history.last().is_some_and(|(_, cap)| cap.is_some());
+    Some((mv, captured))
+}
+
 /// Board coord -> on-screen cell indices, accounting for board flip
 /// (the human side always sits at the bottom).
 fn to_screen(flip: bool, f: i32, r: i32) -> (i32, i32) {
@@ -100,6 +139,16 @@ pub struct XiangqiApp {
     /// Whether a CJK font loaded; if not, pieces are drawn as letters.
     cjk_ok: bool,
 
+    /// Audio output for the piece-drop sound. `None` when no device is
+    /// available (silent fallback) or in headless tests.
+    audio: Option<super::audio::Audio>,
+    /// The move currently being animated (slide + landing pulse), if any.
+    anim: Option<MoveAnim>,
+    /// `game.history` length already accounted for by the animator. A move is
+    /// detected (and the slide + sound triggered) when history grows past it;
+    /// new-game / undo / load resync this baseline so they never animate.
+    anim_ply: usize,
+
     save_path: String,
     message: String,
 }
@@ -137,6 +186,9 @@ impl XiangqiApp {
             ))),
             engine_diff: difficulty,
             cjk_ok,
+            audio: None,
+            anim: None,
+            anim_ply: 0,
             save_path: "xiangqi_save.json".to_owned(),
             message: String::new(),
         };
@@ -145,7 +197,10 @@ impl XiangqiApp {
     }
 
     pub fn new(_cc: &eframe::CreationContext<'_>, cjk_ok: bool) -> Self {
-        Self::bootstrap(cjk_ok)
+        let mut app = Self::bootstrap(cjk_ok);
+        // Best-effort: a missing output device just means silent play.
+        app.audio = super::audio::Audio::new();
+        app
     }
 
     /// Construct without eframe, for tests.
@@ -230,6 +285,14 @@ impl XiangqiApp {
         self.req_id += 1;
     }
 
+    /// Drop any in-flight animation and align the baseline to the current
+    /// history length, so a state reset (new game / undo / load) is not
+    /// mistaken for a forward move and animated.
+    fn reset_anim_baseline(&mut self) {
+        self.anim = None;
+        self.anim_ply = self.game.history.len();
+    }
+
     fn new_game(&mut self) {
         self.game = GameState::new();
         self.human_color = self.pending_color;
@@ -242,6 +305,7 @@ impl XiangqiApp {
         self.ai_rx = None;
         self.req_id += 1;
         self.rebuild_engines();
+        self.reset_anim_baseline();
         self.status = self.game.status();
         self.message.clear();
     }
@@ -265,6 +329,7 @@ impl XiangqiApp {
         self.forced = None;
         self.req_id += 1;
         self.ai_stalled = false;
+        self.reset_anim_baseline();
         self.status = self.game.status();
         self.message.clear();
     }
@@ -303,6 +368,7 @@ impl XiangqiApp {
                 self.ai_rx = None;
                 self.req_id += 1;
                 self.ai_stalled = false;
+                self.reset_anim_baseline();
                 self.status = self.game.status();
                 self.message = format!("已从 {} 载入", self.save_path);
             }
@@ -476,6 +542,30 @@ impl eframe::App for XiangqiApp {
             self.rebuild_engines();
         }
         self.maybe_start_ai(ctx);
+
+        // Single chokepoint for "a move was just played" — covers human moves,
+        // the AI reply, and AI-vs-AI auto-play, since every path grows
+        // `game.history` by one. Resets (new game / undo / load) keep the
+        // baseline in sync so they fall through without animating or beeping.
+        let now = ctx.input(|i| i.time);
+        if let Some((mv, captured)) =
+            move_fx(&self.game.history, self.game.last_move, self.anim_ply)
+        {
+            self.anim = Some(MoveAnim { mv, start: now });
+            if let Some(a) = &self.audio {
+                a.play_move(captured);
+            }
+        }
+        self.anim_ply = self.game.history.len();
+        // Retire the animation once its lifetime elapses; keep repainting
+        // (smooth slide) while it is live.
+        if let Some(a) = self.anim {
+            if now - a.start >= ANIM_TOTAL {
+                self.anim = None;
+            } else {
+                ctx.request_repaint();
+            }
+        }
 
         self.control_panel(ctx);
 
@@ -742,11 +832,23 @@ impl XiangqiApp {
         let targets = self.legal_targets();
         let moved_to = self.game.last_move.map(|m| m.to);
 
+        // Move animation: a live anim within its total lifetime; `hide` is the
+        // destination square while the piece is still sliding (drawn at an
+        // interpolated spot below instead of statically here).
+        let now = ui.input(|i| i.time);
+        let anim = self.anim.filter(|a| now - a.start < ANIM_TOTAL);
+        let hide = anim
+            .filter(|a| now - a.start < ANIM_SLIDE)
+            .map(|a| a.mv.to);
+
         // Pieces.
         for i in 0..CELLS {
             let Some(piece) = self.game.board.get(i) else {
                 continue;
             };
+            if hide == Some(i) {
+                continue; // mid-flight; drawn at its slide position below
+            }
             let c = point(file_of(i), rank_of(i));
             let pc = if piece.color == Color::Red { red } else { black };
             painter.circle_filled(c, cell * 0.42, disc);
@@ -765,6 +867,43 @@ impl XiangqiApp {
                 egui::FontId::proportional(if cjk { cell * 0.5 } else { cell * 0.43 }),
                 pc,
             );
+        }
+
+        // Sliding piece + landing pulse, painted over the settled board so the
+        // move reads as actual motion rather than a teleport.
+        if let Some(a) = anim {
+            let to_c = point(file_of(a.mv.to), rank_of(a.mv.to));
+            let dt = (now - a.start) as f32;
+
+            if (now - a.start) < ANIM_SLIDE {
+                if let Some(piece) = self.game.board.get(a.mv.to) {
+                    let from_c = point(file_of(a.mv.from), rank_of(a.mv.from));
+                    let p = ease_out_cubic(dt / ANIM_SLIDE as f32);
+                    let c = from_c + (to_c - from_c) * p;
+                    let pc = if piece.color == Color::Red { red } else { black };
+                    painter.circle_filled(c, cell * 0.42, disc);
+                    painter.circle_stroke(c, cell * 0.42, egui::Stroke::new(2.0, pc));
+                    painter.text(
+                        c,
+                        egui::Align2::CENTER_CENTER,
+                        if cjk { piece.glyph() } else { piece.ascii() },
+                        egui::FontId::proportional(if cjk { cell * 0.5 } else { cell * 0.43 }),
+                        pc,
+                    );
+                }
+            }
+
+            // Expanding ring at the destination, fading over the full lifetime.
+            let q = (dt / ANIM_TOTAL as f32).clamp(0.0, 1.0);
+            let radius = cell * (0.5 + 0.42 * q);
+            let alpha = (200.0 * (1.0 - q)) as u8;
+            let pulse = egui::Color32::from_rgba_unmultiplied(
+                moved_col.r(),
+                moved_col.g(),
+                moved_col.b(),
+                alpha,
+            );
+            painter.circle_stroke(to_c, radius, egui::Stroke::new(3.0, pulse));
         }
 
         // Legal-target markers.
@@ -800,6 +939,43 @@ impl XiangqiApp {
 #[cfg(test)]
 mod ui_tests {
     use super::*;
+
+    #[test]
+    fn ease_out_cubic_endpoints_and_monotonic() {
+        assert_eq!(ease_out_cubic(0.0), 0.0);
+        assert_eq!(ease_out_cubic(1.0), 1.0);
+        // Clamped outside [0, 1].
+        assert_eq!(ease_out_cubic(-0.5), 0.0);
+        assert_eq!(ease_out_cubic(2.0), 1.0);
+        // Strictly increasing, and ahead of linear (ease-*out*).
+        let mut prev = 0.0;
+        for k in 1..=10 {
+            let p = k as f32 / 10.0;
+            let v = ease_out_cubic(p);
+            assert!(v > prev, "should increase: {v} !> {prev}");
+            assert!(v >= p - 1e-6, "ease-out should lead linear at {p}");
+            prev = v;
+        }
+    }
+
+    #[test]
+    fn move_fx_triggers_only_on_a_forward_move() {
+        let m = Move { from: idx(0, 6), to: idx(0, 5) };
+        let soldier = Piece { kind: PieceKind::Soldier, color: Color::Red };
+
+        // No history yet, or history not grown past the baseline -> no fx.
+        assert_eq!(move_fx(&[], None, 0), None);
+        let one = vec![(m, None)];
+        assert_eq!(move_fx(&one, Some(m), 1), None); // len == baseline
+        assert_eq!(move_fx(&one, Some(m), 2), None); // len < baseline (reset)
+
+        // A forward non-capturing move.
+        assert_eq!(move_fx(&one, Some(m), 0), Some((m, false)));
+
+        // A forward capturing move (newest entry holds the taken piece).
+        let two = vec![(m, None), (m, Some(soldier))];
+        assert_eq!(move_fx(&two, Some(m), 1), Some((m, true)));
+    }
 
     #[test]
     fn flip_mapping_is_exact_inverse() {
