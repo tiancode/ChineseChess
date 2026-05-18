@@ -193,8 +193,13 @@ fn engine_benchmark() {
     use std::time::{Duration, Instant};
 
     // Mirrors make_engine()'s difficulty -> (max depth, budget ms) mapping.
-    let levels: [(u8, u8, u64); 5] =
-        [(1, 3, 120), (2, 5, 350), (3, 7, 900), (4, 10, 2000), (5, 14, 4500)];
+    let levels: [(u8, u8, u64); 5] = [
+        (1, 4, 200),
+        (2, 6, 800),
+        (3, 10, 3_000),
+        (4, 18, 15_000),
+        (5, 28, 90_000),
+    ];
 
     let opening = GameState::new();
     let mut midgame = GameState::new();
@@ -212,7 +217,7 @@ fn engine_benchmark() {
             let dt = t.elapsed();
             let n = e.nodes_searched();
             println!(
-                "diff {diff} (depth<= {depth:>2}, {ms:>4}ms): {:>6} ms, {:>9} nodes, {:>6.0} knps, mv={:?}",
+                "diff {diff} (depth<= {depth:>2}, {ms:>5}ms): {:>6} ms, {:>9} nodes, {:>6.0} knps, mv={:?}",
                 dt.as_millis(),
                 n,
                 n as f64 / dt.as_secs_f64() / 1000.0,

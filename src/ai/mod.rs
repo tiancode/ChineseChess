@@ -52,22 +52,31 @@ pub fn make_engine(
     let d = difficulty.clamp(1, 5);
     match kind {
         EngineKind::AlphaBeta => {
+            // The depth cap is set well above what the clock allows at the
+            // higher levels, so the *time budget* is the real limiter there:
+            // iterative deepening keeps going deeper until the deadline. This
+            // is what makes level 5 actually think ~1.5 min instead of
+            // finishing a shallow depth in a few seconds.
             let (depth, ms) = match d {
-                1 => (3, 120),
-                2 => (5, 350),
-                3 => (7, 900),
-                4 => (10, 2_000),
-                _ => (14, 4_500),
+                1 => (4, 200),
+                2 => (6, 800),
+                3 => (10, 3_000),
+                4 => (18, 15_000),
+                _ => (28, 90_000),
             };
             Box::new(search::SearchEngine::new(depth, Duration::from_millis(ms)))
         }
         EngineKind::AlphaZero => {
+            // AlphaZero strength scales with the MCTS simulation count. Unlike
+            // AlphaBeta there is no time budget: wall-clock per move is sims ×
+            // sidecar inference speed (CPU/GPU, model size), so the higher
+            // levels are "stronger", not pinned to a fixed think time.
             let sims = match d {
-                1 => 40,
-                2 => 100,
-                3 => 200,
-                4 => 400,
-                _ => 800,
+                1 => 100,
+                2 => 300,
+                3 => 800,
+                4 => 2_000,
+                _ => 4_000,
             };
             Box::new(alphazero::AlphaZeroEngine::new(sims))
         }
