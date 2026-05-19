@@ -21,7 +21,15 @@ use crate::moves::piece_value as base_value;
 const INF: i32 = 32_001;
 const MATE: i32 = 30_000;
 const MATE_THRESHOLD: i32 = MATE - 256;
-const MAX_PLY: usize = 64;
+/// Absolute recursion bound. Extensions can hold `depth` constant down a long
+/// forcing line, so the search must cap ply itself or it can recurse without
+/// bound and overflow the (spawned-thread) stack.
+const MAX_PLY: usize = 128;
+
+/// Stack size for the engine's spawned threads. `search` frames are large
+/// (heavy eval + many locals) and recursion can reach `MAX_PLY`+quiescence,
+/// well past a spawned thread's 2 MiB default — so give it room.
+pub const SEARCH_STACK: usize = 32 << 20; // 32 MiB
 /// Butterfly-history saturation bound. The gravity update keeps every entry
 /// strictly inside (-HISTORY_MAX, HISTORY_MAX), so quiet ordering scores never
 /// collide with the killer / countermove / capture bands.
@@ -1205,6 +1213,15 @@ impl SearchEngine {
         // subtree's aggregate flag.
         self.path_dep = false;
 
+        // Hard recursion bound. A check extension keeps `depth` constant down
+        // a forcing line, so without this cap a long (non-repeating) checking
+        // sequence recurses until the stack overflows. Fall back to a static
+        // (quiescence) score — `path_dep` is already cleared, and the
+        // perpetual-check repetition test above has already had its say.
+        if ply >= MAX_PLY {
+            return self.quiescence(board, side, alpha, beta, mat);
+        }
+
         let alpha_orig = alpha;
         if let Some(e) = self.tt.probe(key) {
             if e.depth >= depth {
@@ -1553,7 +1570,10 @@ impl Engine for SearchEngine {
             std::thread::scope(|scope| {
                 for i in 1..self.threads {
                     let mut w = self.clone_worker(i);
-                    scope.spawn(move || w.helper_loop(state));
+                    let b = std::thread::Builder::new().stack_size(SEARCH_STACK);
+                    // If a helper fails to spawn, just run fewer — the primary
+                    // thread still produces a correct result.
+                    let _ = b.spawn_scoped(scope, move || w.helper_loop(state));
                 }
                 let r = self.run_root(state, &mut root_board, &root_moves, side);
                 self.stop.store(true, Ordering::Relaxed); // wind the helpers down

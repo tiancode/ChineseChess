@@ -565,6 +565,35 @@ fn smp_engine_plays_legal_moves() {
     }
 }
 
+/// Regression for the check-extension stack overflow: a check extension keeps
+/// `depth` constant, so a long forcing line must still be hard-bounded by the
+/// ply cap. Run on a production-sized stack and assert the search returns
+/// (process-aborting overflow would fail this in CI).
+#[test]
+fn deep_checking_search_is_bounded() {
+    use crate::ai::search::{SearchEngine, SEARCH_STACK};
+    use std::time::Duration;
+    let h = std::thread::Builder::new()
+        .stack_size(SEARCH_STACK)
+        .spawn(|| {
+            let mut g = GameState::new();
+            g.board = Board::empty();
+            place(&mut g.board, 4, 0, PieceKind::General, Color::Black);
+            place(&mut g.board, 3, 9, PieceKind::General, Color::Red);
+            place(&mut g.board, 4, 5, PieceKind::Chariot, Color::Red);
+            place(&mut g.board, 6, 5, PieceKind::Chariot, Color::Red);
+            g.side_to_move = Color::Red;
+            // High depth cap but time-bounded: an unbounded check-extension
+            // recursion overflows in milliseconds, so a short budget is a
+            // sufficient (and fast) regression guard.
+            let mut e = SearchEngine::new(64, Duration::from_millis(300));
+            e.best_move(&g)
+        })
+        .expect("spawn search thread");
+    let mv = h.join().expect("search must not overflow the stack");
+    assert!(mv.is_some(), "engine must return a move");
+}
+
 #[test]
 fn engine_finds_mate_in_one() {
     // Red to move; Cd-e1 style: sliding the chariot to (5,1) mates the bare

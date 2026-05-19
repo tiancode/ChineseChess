@@ -395,13 +395,21 @@ impl XiangqiApp {
         let game = self.game.clone();
         let id = self.req_id;
         let engine = Arc::clone(self.engine_for(side));
-        thread::spawn(move || {
-            let mv = match engine.lock() {
-                Ok(mut e) => e.best_move(&game),
-                Err(_) => None, // poisoned: engine panicked previously
-            };
-            let _ = tx.send((id, mv));
-        });
+        // A generous stack: the search recurses up to MAX_PLY with large
+        // frames (and on this thread runs the primary Lazy-SMP worker).
+        let spawned = thread::Builder::new()
+            .stack_size(crate::ai::search::SEARCH_STACK)
+            .spawn(move || {
+                let mv = match engine.lock() {
+                    Ok(mut e) => e.best_move(&game),
+                    Err(_) => None, // poisoned: engine panicked previously
+                };
+                let _ = tx.send((id, mv));
+            });
+        if spawned.is_err() {
+            self.thinking = false; // could not start the search this frame
+            return;
+        }
         self.ai_rx = Some(rx);
         self.thinking = true;
         ctx.request_repaint();
