@@ -544,6 +544,27 @@ fn engine_ab_selfplay() {
     );
 }
 
+/// Lazy-SMP correctness: with several worker threads sharing the atomic TT,
+/// every returned move must still be legal and the game must progress without
+/// a panic or hang (a data race / torn TT read would surface here).
+#[test]
+fn smp_engine_plays_legal_moves() {
+    use crate::ai::search::{SearchEngine, Tuning};
+    use std::time::Duration;
+
+    let mut g = GameState::new();
+    let mut e = SearchEngine::new_tuned(64, Duration::from_millis(40), Tuning::full(), 18)
+        .with_threads(4);
+    for _ in 0..12 {
+        if !matches!(g.status(), GameStatus::Ongoing | GameStatus::Check(_)) {
+            break;
+        }
+        let mv = e.best_move(&g).expect("a legal move");
+        assert!(g.is_legal(mv), "SMP returned an illegal move: {mv:?}");
+        g.apply(mv);
+    }
+}
+
 #[test]
 fn engine_finds_mate_in_one() {
     // Red to move; Cd-e1 style: sliding the chariot to (5,1) mates the bare

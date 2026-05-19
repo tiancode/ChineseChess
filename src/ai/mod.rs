@@ -67,12 +67,28 @@ pub fn make_engine(
                 4 => (18, 15_000, 22),
                 _ => (28, 90_000, 23),
             };
-            Box::new(search::SearchEngine::new_tuned(
-                depth,
-                Duration::from_millis(ms),
-                search::Tuning::full(),
-                tt_bits,
-            ))
+            // Lazy-SMP thread count: harder levels (which actually think long
+            // enough to benefit) get more cores, capped to what's available.
+            let par = std::thread::available_parallelism()
+                .map(|n| n.get())
+                .unwrap_or(1);
+            let threads = match d {
+                1 | 2 => 1,
+                3 => 2,
+                4 => 4,
+                _ => 8,
+            }
+            .min(par)
+            .max(1);
+            Box::new(
+                search::SearchEngine::new_tuned(
+                    depth,
+                    Duration::from_millis(ms),
+                    search::Tuning::full(),
+                    tt_bits,
+                )
+                .with_threads(threads),
+            )
         }
         EngineKind::AlphaZero => {
             // AlphaZero strength scales with the MCTS simulation count. Unlike

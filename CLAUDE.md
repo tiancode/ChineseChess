@@ -8,15 +8,19 @@ A Chinese Chess (Xiangqi) desktop program: Rust + `egui`/`eframe` GUI with a plu
 
 ```bash
 cargo run --release          # play (release is required for the AI to be responsive)
-cargo test                   # default suite (~34 tests: rules/perft, engine tactics, UI logic)
+cargo test                   # default suite (~45 tests: rules/perft, SEE/eval, engine tactics, SMP, UI)
 cargo test <name>            # single test, e.g. `cargo test perft_matches_known_values`
+cargo test                   # run in DEBUG to exercise the incremental key/eval parity asserts
 cargo clippy --all-targets   # expected to be warning-free; keep it that way
 cargo test --release engine_benchmark -- --ignored --nocapture       # node-count benchmark
+cargo test --release engine_ab_selfplay -- --ignored --nocapture     # A/B strength gate (full vs baseline)
 cargo test alphazero_sidecar -- --ignored                            # exercises the Python sidecar (needs torch)
 ```
 
-Two tests are `#[ignore]`d so the default suite needs no PyTorch: `engine_benchmark`
-and `alphazero_sidecar_returns_legal_move`. The release profile sets `lto = true` /
+Three tests are `#[ignore]`d so the default suite is fast and needs no PyTorch:
+`engine_benchmark`, `engine_ab_selfplay`, and `alphazero_sidecar_returns_legal_move`.
+The debug suite is the correctness guard for the incremental Zobrist/psqt (the
+`debug_assert_eq!` parity checks only run in debug). The release profile sets `lto = true` /
 `opt-level = 3`; debug-mode AI is much slower.
 
 The AlphaZero trainer is a separate Python project (`alphazero/`, see its own
@@ -58,7 +62,7 @@ The search Zobrist key **and** the material/piece-square score (`psqt_abs`, kept
 
 `ai/mod.rs` defines `trait Engine { name(); best_move(&GameState) -> Option<Move> }` and an `EngineKind { AlphaBeta, AlphaZero }`. `make_engine(kind, difficulty, perspective)` is the **single** place engines are constructed: difficulty 1–5 maps to `(max_depth, time_budget)` for `AlphaBeta` and to an MCTS `sims` count for `AlphaZero` (no time budget — per-move wall-clock is `sims` × sidecar inference speed). The UI, threading, and legality checks all adapt automatically — to add another engine, add an `EngineKind` arm, implement `Engine`, and return it from `make_engine`, change nothing else.
 
-`ai/search.rs` is the bundled engine: iterative deepening + alpha-beta/PVS, depth-preferred transposition table, quiescence search, MVV-LVA + killer move ordering, piece-square evaluation. Mate scores are stored TT-relative to the node via `adjust_to_tt`/`adjust_from_tt` (not relative to the root). The root searches every move with a full window (PVS only in the interior) so the equal-best pool used for move variety stays honest.
+`ai/search.rs` is the bundled engine: iterative deepening + alpha-beta/PVS with selective search — null-move pruning, late move reductions, reverse-futility, razoring, late move pruning, and a check extension (all gated to non-PV/not-in-check/out-of-mate-zone nodes, and the CCA repetition check always runs first). Move ordering is TT → SEE-classified captures → killers → countermove → butterfly history. Evaluation is incremental material+PST (`psqt_abs`, Red-absolute) plus a recomputed positional layer (`positional_abs`: tapered king/palace safety, defensive-shape integrity, mobility with horse-leg/窝心马, chariot files, …). Mate scores are stored TT-relative via `adjust_to_tt`/`adjust_from_tt`. The root searches every move with a full window (PVS only in the interior) so the equal-best pool stays honest, and never widens the variety pool near a forced mate. Heuristics sit behind a `Tuning` struct (`full` vs `baseline`) driving the `#[ignore]` `engine_ab_selfplay` A/B gate. The transposition table is a lock-free atomic `SharedTt` (Hyatt key^data scheme, generation aging) shared by **Lazy-SMP** workers: `best_move` spawns `threads-1` helper threads via `std::thread::scope` to flood the TT while the primary thread runs the authoritative root; `threads == 1` (tests, A/B harness) skips spawning and is byte-for-byte deterministic. Per-thread state (search stack, killers/history/countermove) is private; the TT and read-only `game_counts` are shared via `Arc`.
 
 ### UI / threading (`ui/app.rs`)
 

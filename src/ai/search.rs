@@ -6,7 +6,8 @@
 //! threading, and difficulty wiring are unchanged.
 
 use std::collections::HashMap;
-use std::sync::OnceLock;
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
+use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
 use super::Engine;
@@ -175,67 +176,136 @@ enum Bound {
     Upper,
 }
 
+/// Unpacked view of a slot (the stored key is validated by the XOR trick in
+/// `probe`, so it is not part of the view).
 #[derive(Clone, Copy)]
 struct TtEntry {
-    key: u64,
     depth: i16,
     score: i32,
     bound: Bound,
     best: Option<Move>,
-    /// Search generation that wrote this entry (for aging across moves).
-    gen: u8,
 }
 
-struct Tt {
-    slots: Vec<Option<TtEntry>>,
-    mask: usize,
-    /// Bumped once per `best_move`; entries from older generations are
-    /// considered stale and freely overwritten regardless of depth.
-    gen: u8,
+const MOVE_NONE: u16 = u16::MAX;
+
+#[inline]
+fn enc_move(m: Option<Move>) -> u16 {
+    match m {
+        Some(mv) => (mv.from as u16) * 90 + mv.to as u16, // 0..8099
+        None => MOVE_NONE,
+    }
+}
+#[inline]
+fn dec_move(c: u16) -> Option<Move> {
+    if c == MOVE_NONE {
+        None
+    } else {
+        Some(Move {
+            from: (c / 90) as usize,
+            to: (c % 90) as usize,
+        })
+    }
 }
 
-impl Tt {
-    fn new(bits: u32) -> Self {
-        let size = 1usize << bits;
-        Tt {
-            slots: vec![None; size],
-            mask: size - 1,
-            gen: 0,
-        }
-    }
-
-    /// Start of a new search: age every entry by one generation.
-    fn new_generation(&mut self) {
-        self.gen = self.gen.wrapping_add(1);
-    }
-
-    fn probe(&self, key: u64) -> Option<TtEntry> {
-        match self.slots[(key as usize) & self.mask] {
-            Some(e) if e.key == key => Some(e),
-            _ => None,
-        }
-    }
-
-    fn store(&mut self, key: u64, depth: i16, score: i32, bound: Bound, best: Option<Move>) {
-        let gen = self.gen;
-        let slot = &mut self.slots[(key as usize) & self.mask];
-        // Keep an entry only if it is from *this* search, a different
-        // position, and strictly deeper. Same-position refreshes, shallower
-        // entries, and anything from a previous search are replaced — this is
-        // depth-preferred with aging (a stale deep entry never wedges a slot).
-        if let Some(e) = slot {
-            if e.key != key && e.gen == gen && e.depth > depth {
-                return;
-            }
-        }
-        *slot = Some(TtEntry {
-            key,
+// Pack a slot into 64 bits: move[0:16) bound[16:18) score(i16)[18:34)
+// depth(i8)[34:42) gen(u8)[42:50). Scores fit i16 (|mate|≈30000, evals a few
+// thousand); depth is clamped to [-1,126] for the replacement heuristic.
+#[inline]
+fn pack(depth: i16, score: i32, bound: Bound, best: Option<Move>, gen: u8) -> u64 {
+    let mc = enc_move(best) as u64;
+    let b = match bound {
+        Bound::Exact => 0u64,
+        Bound::Lower => 1,
+        Bound::Upper => 2,
+    };
+    let s = ((score.clamp(i16::MIN as i32, i16::MAX as i32) as i16) as u16) as u64;
+    let d = ((depth.clamp(-1, 126) as i8) as u8) as u64;
+    mc | (b << 16) | (s << 18) | (d << 34) | ((gen as u64) << 42)
+}
+#[inline]
+fn unpack(data: u64) -> (TtEntry, u8) {
+    let mc = (data & 0xFFFF) as u16;
+    let bound = match (data >> 16) & 3 {
+        0 => Bound::Exact,
+        1 => Bound::Lower,
+        _ => Bound::Upper,
+    };
+    let score = ((((data >> 18) & 0xFFFF) as u16) as i16) as i32;
+    let depth = ((((data >> 34) & 0xFF) as u8) as i8) as i16;
+    let gen = ((data >> 42) & 0xFF) as u8;
+    (
+        TtEntry {
             depth,
             score,
             bound,
-            best,
-            gen,
-        });
+            best: dec_move(mc),
+        },
+        gen,
+    )
+}
+
+/// Concurrent transposition table shared by all Lazy-SMP workers. Each slot is
+/// two atomics holding `key ^ data` and `data`; a reader recomputes the key as
+/// their XOR, so a torn read from another thread simply fails the key match
+/// and is treated as a miss (Hyatt's lockless scheme — no per-slot locking).
+struct SharedTt {
+    slots: Vec<(AtomicU64, AtomicU64)>,
+    mask: usize,
+    /// Bumped once per `best_move`; entries from older generations are stale
+    /// and freely overwritten regardless of depth. `gen == 0` marks empty.
+    gen: AtomicU8,
+}
+
+impl SharedTt {
+    fn new(bits: u32) -> Self {
+        let size = 1usize << bits;
+        let mut slots = Vec::with_capacity(size);
+        slots.resize_with(size, || (AtomicU64::new(0), AtomicU64::new(0)));
+        SharedTt {
+            slots,
+            mask: size - 1,
+            gen: AtomicU8::new(0),
+        }
+    }
+
+    fn new_generation(&self) {
+        self.gen.fetch_add(1, Ordering::Relaxed);
+    }
+    #[inline]
+    fn cur_gen(&self) -> u8 {
+        self.gen.load(Ordering::Relaxed)
+    }
+
+    fn probe(&self, key: u64) -> Option<TtEntry> {
+        let (kx, dx) = &self.slots[(key as usize) & self.mask];
+        let data = dx.load(Ordering::Relaxed);
+        let xk = kx.load(Ordering::Relaxed);
+        if data != 0 && (xk ^ data) == key {
+            Some(unpack(data).0)
+        } else {
+            None
+        }
+    }
+
+    fn store(&self, key: u64, depth: i16, score: i32, bound: Bound, best: Option<Move>) {
+        let gen = self.cur_gen();
+        let (kx, dx) = &self.slots[(key as usize) & self.mask];
+        let od = dx.load(Ordering::Relaxed);
+        if od != 0 {
+            let ox = kx.load(Ordering::Relaxed);
+            let (e, eg) = unpack(od);
+            // Keep only a same-search, different-position, strictly deeper
+            // entry (depth-preferred with aging; stale entries never wedge).
+            if (ox ^ od) != key && eg == gen && e.depth > depth {
+                return;
+            }
+        }
+        let mut data = pack(depth, score, bound, best, gen);
+        if data == 0 {
+            data = 1; // never collide with the empty sentinel
+        }
+        kx.store(key ^ data, Ordering::Relaxed);
+        dx.store(data, Ordering::Relaxed);
     }
 }
 
@@ -588,7 +658,14 @@ fn side_xor() -> u64 {
 pub struct SearchEngine {
     max_depth: u8,
     budget: Duration,
-    tt: Tt,
+    /// Shared across all Lazy-SMP workers (atomic, lock-free).
+    tt: Arc<SharedTt>,
+    /// Number of search threads (1 = single-threaded, fully deterministic;
+    /// the path tests / A/B harness keep this at 1).
+    threads: usize,
+    /// Cooperative stop flag: the deadline (or game end) trips it and every
+    /// worker's `time_up` observes it.
+    stop: Arc<AtomicBool>,
     killers: [[Option<Move>; 2]; MAX_PLY],
     /// Butterfly history: quiet-move cutoff counters indexed [from][to].
     /// Boxed so the ~32 KB table is heap-allocated, not on the search stack.
@@ -603,7 +680,8 @@ pub struct SearchEngine {
     nodes: u64,
     aborted: bool,
     /// How many times each position occurred in the actual game so far.
-    game_counts: HashMap<u64, u32>,
+    /// Built once per move, then shared read-only with the worker threads.
+    game_counts: Arc<HashMap<u64, u32>>,
     path: Vec<u64>,
     /// Parallel to `path`: did the move that produced that position give
     /// check? Used to score a repetition reached by perpetual check (长将)
@@ -633,7 +711,9 @@ impl SearchEngine {
         SearchEngine {
             max_depth: max_depth.max(1),
             budget,
-            tt: Tt::new(tt_bits.clamp(10, 26)),
+            tt: Arc::new(SharedTt::new(tt_bits.clamp(10, 26))),
+            threads: 1,
+            stop: Arc::new(AtomicBool::new(false)),
             killers: [[None; 2]; MAX_PLY],
             history: Box::new([[0; CELLS]; CELLS]),
             counter: Box::new([[None; CELLS]; CELLS]),
@@ -642,7 +722,42 @@ impl SearchEngine {
             deadline: Instant::now(),
             nodes: 0,
             aborted: false,
-            game_counts: HashMap::new(),
+            game_counts: Arc::new(HashMap::new()),
+            path: Vec::with_capacity(MAX_PLY),
+            path_check: Vec::with_capacity(MAX_PLY),
+            path_dep: false,
+        }
+    }
+
+    /// Set the number of Lazy-SMP search threads (clamped ≥ 1). Called by
+    /// `make_engine`; tests leave it at 1 for determinism.
+    pub fn with_threads(mut self, n: usize) -> Self {
+        self.threads = n.max(1);
+        self
+    }
+
+    /// A fresh per-thread worker that *shares* the TT, the read-only game
+    /// repetition counts, and the stop flag, but has its own search stack,
+    /// killers/history/countermove tables, and a decorrelated RNG.
+    fn clone_worker(&self, idx: usize) -> SearchEngine {
+        SearchEngine {
+            max_depth: self.max_depth,
+            budget: self.budget,
+            tt: Arc::clone(&self.tt),
+            threads: self.threads,
+            stop: Arc::clone(&self.stop),
+            killers: [[None; 2]; MAX_PLY],
+            history: Box::new([[0; CELLS]; CELLS]),
+            counter: Box::new([[None; CELLS]; CELLS]),
+            tuning: self.tuning,
+            rng: self
+                .rng
+                .wrapping_add(0x9E37_79B9_7F4A_7C15u64.wrapping_mul(idx as u64 + 1))
+                | 1,
+            deadline: self.deadline,
+            nodes: 0,
+            aborted: false,
+            game_counts: Arc::clone(&self.game_counts),
             path: Vec::with_capacity(MAX_PLY),
             path_check: Vec::with_capacity(MAX_PLY),
             path_dep: false,
@@ -697,9 +812,15 @@ impl SearchEngine {
         if self.aborted {
             return true;
         }
+        // Another worker may have hit the deadline first.
+        if self.stop.load(Ordering::Relaxed) {
+            self.aborted = true;
+            return true;
+        }
         // Check the clock only occasionally; it is relatively expensive.
         if self.nodes & 2047 == 0 && Instant::now() >= self.deadline {
             self.aborted = true;
+            self.stop.store(true, Ordering::Relaxed); // stop the other workers
         }
         self.aborted
     }
@@ -708,7 +829,7 @@ impl SearchEngine {
     /// the search can detect a *threefold* repetition (rather than treating
     /// any transient transposition as an immediate draw).
     fn build_repetition(&mut self, state: &GameState) {
-        self.game_counts.clear();
+        let mut counts: HashMap<u64, u32> = HashMap::new();
         let mut b = state.board;
         for (mv, captured) in state.history.iter().rev() {
             b.unmake(*mv, *captured);
@@ -719,12 +840,13 @@ impl SearchEngine {
         } else {
             state.side_to_move.opposite()
         };
-        *self.game_counts.entry(zkey(&b, side)).or_insert(0) += 1;
+        *counts.entry(zkey(&b, side)).or_insert(0) += 1;
         for (mv, _) in state.history.iter() {
             b.make(*mv);
             side = side.opposite();
-            *self.game_counts.entry(zkey(&b, side)).or_insert(0) += 1;
+            *counts.entry(zkey(&b, side)).or_insert(0) += 1;
         }
+        self.game_counts = Arc::new(counts);
     }
 }
 
@@ -1360,6 +1482,7 @@ impl Engine for SearchEngine {
         self.deadline = Instant::now() + self.budget;
         self.nodes = 0;
         self.aborted = false;
+        self.stop.store(false, Ordering::Relaxed);
         self.killers = [[None; 2]; MAX_PLY];
         // Quiet-move ordering stats start fresh each move so play stays
         // deterministic given the position (no carry-over between turns).
@@ -1368,22 +1491,47 @@ impl Engine for SearchEngine {
         // Age the persisted TT so last move's entries don't wedge slots.
         self.tt.new_generation();
 
+        // Lazy SMP: helper threads flood the shared TT while the primary
+        // thread runs the authoritative root search (the one that builds the
+        // variety pool). `threads == 1` skips spawning entirely so the path
+        // tests and A/B harness stay byte-for-byte deterministic.
+        if self.threads > 1 {
+            std::thread::scope(|scope| {
+                for i in 1..self.threads {
+                    let mut w = self.clone_worker(i);
+                    scope.spawn(move || w.helper_loop(state));
+                }
+                let r = self.run_root(state, &mut root_board, &root_moves, side);
+                self.stop.store(true, Ordering::Relaxed); // wind the helpers down
+                r
+            })
+        } else {
+            self.run_root(state, &mut root_board, &root_moves, side)
+        }
+    }
+}
+
+impl SearchEngine {
+    /// Authoritative iterative-deepening root (primary thread): every root
+    /// move is searched with a full window so the equal-best pool stays
+    /// honest, then the variety pool is built and a move chosen.
+    fn run_root(
+        &mut self,
+        state: &GameState,
+        root_board: &mut Board,
+        root_moves: &[Move],
+        side: Color,
+    ) -> Option<Move> {
         let mut best = root_moves[0];
         let mut best_pool = vec![root_moves[0]];
 
-        // Iterative deepening: each completed depth refines the move and
-        // seeds the next iteration's ordering via the transposition table.
         for depth in 1..=self.max_depth as i16 {
-            let key = zkey(&root_board, side);
-            let mat = psqt_abs(&root_board);
+            let key = zkey(root_board, side);
+            let mat = psqt_abs(root_board);
             let tt_move = self.tt.probe(key).and_then(|e| e.best);
-            let mut moves = root_moves.clone();
-            self.order(&mut root_board, &mut moves, tt_move.or(Some(best)), 0, None);
+            let mut moves = root_moves.to_vec();
+            self.order(root_board, &mut moves, tt_move.or(Some(best)), 0, None);
 
-            // Root is searched with a full window per move so the scores are
-            // exact: this keeps the equal-best pool honest (a null-window /
-            // PVS probe returns fail-low bounds that spuriously look "equal").
-            // Alpha-beta + PVS still prune inside the deep interior search.
             let mut best_score = -INF;
             let mut local_best = moves[0];
             let mut scored: Vec<(Move, i32)> = Vec::with_capacity(moves.len());
@@ -1391,10 +1539,10 @@ impl Engine for SearchEngine {
             let mut root_dep = false; // any root line influenced by repetition?
 
             for mv in moves.iter() {
-                let (kx, dm) = move_delta(&root_board, *mv);
+                let (kx, dm) = move_delta(root_board, *mv);
                 let captured = root_board.make(*mv);
                 let score = -self.search(
-                    &mut root_board,
+                    root_board,
                     side.opposite(),
                     depth - 1,
                     -INF,
@@ -1420,16 +1568,9 @@ impl Engine for SearchEngine {
 
             if completed {
                 best = local_best;
-                // Equally-best moves give natural variety. In the opening,
-                // widen the pool to every move within `OPENING_MARGIN` of the
-                // best (near-best, so still sound) so games don't always start
-                // identically; afterwards require an exact tie, leaving normal
-                // play strength unchanged.
-                // Never widen near a forced mate: mate scores only differ by
-                // their distance, so an 80cp band would lump mate-in-1 with
-                // mate-in-3 and the random pick could throw away the faster
-                // win. Require an exact tie there (still sound, and keeps
-                // shortest-mate play deterministic).
+                // Equal-best pool for opening variety; never widen near a
+                // forced mate (mate-in-1 vs mate-in-3 are within 80cp, and the
+                // random pick must not discard the faster win).
                 let near_mate = best_score.abs() > MATE_THRESHOLD;
                 let cutoff = if self.tuning.variety
                     && state.history.len() < OPENING_PLIES
@@ -1456,9 +1597,50 @@ impl Engine for SearchEngine {
             }
         }
 
-        // Vary play among equally-best moves.
         let pick = (self.next_rand() as usize) % best_pool.len();
         Some(best_pool.get(pick).copied().unwrap_or(best))
+    }
+
+    /// Helper-thread loop: iterative deepening that only floods the shared TT
+    /// (no pool, no return value). A per-thread starting-depth offset plus the
+    /// decorrelated RNG make workers explore diverse subtrees (Lazy SMP).
+    fn helper_loop(&mut self, state: &GameState) {
+        let side = state.side_to_move;
+        let mut rb = state.board;
+        let root_moves = legal_moves(&mut rb, side);
+        if root_moves.len() <= 1 {
+            return;
+        }
+        let start = 1 + (self.rng & 1) as i16;
+        for depth in start..=self.max_depth as i16 {
+            if self.time_up() {
+                break;
+            }
+            let key = zkey(&rb, side);
+            let mat = psqt_abs(&rb);
+            let tt_move = self.tt.probe(key).and_then(|e| e.best);
+            let mut moves = root_moves.clone();
+            self.order(&mut rb, &mut moves, tt_move, 0, None);
+            for mv in &moves {
+                if self.time_up() {
+                    break;
+                }
+                let (kx, dm) = move_delta(&rb, *mv);
+                let cap = rb.make(*mv);
+                let _ = self.search(
+                    &mut rb,
+                    side.opposite(),
+                    depth - 1,
+                    -INF,
+                    INF,
+                    1,
+                    Some(*mv),
+                    key ^ kx,
+                    mat + dm,
+                );
+                rb.unmake(*mv, cap);
+            }
+        }
     }
 }
 
