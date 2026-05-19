@@ -25,6 +25,10 @@ const MAX_PLY: usize = 64;
 /// strictly inside (-HISTORY_MAX, HISTORY_MAX), so quiet ordering scores never
 /// collide with the killer / countermove / capture bands.
 const HISTORY_MAX: i32 = 1 << 20;
+/// Default transposition-table size (2^bits entries). `make_engine` overrides
+/// this per difficulty; this is the fallback for tests / direct construction.
+#[allow(dead_code)] // used by tests / direct construction, not by make_engine
+const DEFAULT_TT_BITS: u32 = 21; // ~2M entries
 
 // --- Phase 2 selective-search tuning constants ---
 /// Reverse-futility: prune when `eval - RFP_MARGIN*depth >= beta`.
@@ -178,11 +182,16 @@ struct TtEntry {
     score: i32,
     bound: Bound,
     best: Option<Move>,
+    /// Search generation that wrote this entry (for aging across moves).
+    gen: u8,
 }
 
 struct Tt {
     slots: Vec<Option<TtEntry>>,
     mask: usize,
+    /// Bumped once per `best_move`; entries from older generations are
+    /// considered stale and freely overwritten regardless of depth.
+    gen: u8,
 }
 
 impl Tt {
@@ -191,7 +200,13 @@ impl Tt {
         Tt {
             slots: vec![None; size],
             mask: size - 1,
+            gen: 0,
         }
+    }
+
+    /// Start of a new search: age every entry by one generation.
+    fn new_generation(&mut self) {
+        self.gen = self.gen.wrapping_add(1);
     }
 
     fn probe(&self, key: u64) -> Option<TtEntry> {
@@ -202,14 +217,25 @@ impl Tt {
     }
 
     fn store(&mut self, key: u64, depth: i16, score: i32, bound: Bound, best: Option<Move>) {
+        let gen = self.gen;
         let slot = &mut self.slots[(key as usize) & self.mask];
-        // Depth-preferred replacement.
+        // Keep an entry only if it is from *this* search, a different
+        // position, and strictly deeper. Same-position refreshes, shallower
+        // entries, and anything from a previous search are replaced — this is
+        // depth-preferred with aging (a stale deep entry never wedges a slot).
         if let Some(e) = slot {
-            if e.key == key && e.depth > depth {
+            if e.key != key && e.gen == gen && e.depth > depth {
                 return;
             }
         }
-        *slot = Some(TtEntry { key, depth, score, bound, best });
+        *slot = Some(TtEntry {
+            key,
+            depth,
+            score,
+            bound,
+            best,
+            gen,
+        });
     }
 }
 
@@ -285,16 +311,43 @@ fn pst(kind: PieceKind, color: Color, sq: usize) -> i32 {
     }
 }
 
-/// Static evaluation from the perspective of `side` (higher = better).
-fn evaluate(board: &Board, side: Color) -> i32 {
+/// Material + piece-square score in **Red-absolute** form (Red positive,
+/// Black negative). This is the perspective-independent accumulator the
+/// search maintains incrementally; `evaluate` just orients it.
+fn psqt_abs(board: &Board) -> i32 {
     let mut score = 0;
     for (sq, cell) in board.cells.iter().enumerate() {
         if let Some(p) = cell {
             let v = base_value(p.kind) + pst(p.kind, p.color, sq);
-            score += if p.color == side { v } else { -v };
+            score += if p.color == Color::Red { v } else { -v };
         }
     }
     score
+}
+
+/// Incremental deltas applied when `mv` is made on `board` (read **before**
+/// `board.make`): the XOR to fold into the running Zobrist key, and the change
+/// to the Red-absolute psqt accumulator. Xiangqi has no promotion, so the
+/// mover's kind never changes and base values cancel on a non-capture.
+#[inline]
+fn move_delta(board: &Board, mv: Move) -> (u64, i32) {
+    let (table, side_key) = zobrist();
+    let p = board.get(mv.from).expect("a mover exists");
+    let sgn = |c: Color| if c == Color::Red { 1 } else { -1 };
+    let mut kx = *side_key; // side to move flips every move
+    kx ^= table[piece_index(p)][mv.from] ^ table[piece_index(p)][mv.to];
+    let mut dm = sgn(p.color) * (pst(p.kind, p.color, mv.to) - pst(p.kind, p.color, mv.from));
+    if let Some(c) = board.get(mv.to) {
+        kx ^= table[piece_index(c)][mv.to];
+        dm -= sgn(c.color) * (base_value(c.kind) + pst(c.kind, c.color, mv.to));
+    }
+    (kx, dm)
+}
+
+/// XOR that toggles only the side-to-move (for a null move).
+#[inline]
+fn side_xor() -> u64 {
+    zobrist().1
 }
 
 // ----------------------------------------------------------------------------
@@ -333,12 +386,14 @@ pub struct SearchEngine {
 }
 
 impl SearchEngine {
+    #[allow(dead_code)] // convenience constructor for tests / benchmark
     pub fn new(max_depth: u8, budget: Duration) -> Self {
-        SearchEngine::new_tuned(max_depth, budget, Tuning::full())
+        SearchEngine::new_tuned(max_depth, budget, Tuning::full(), DEFAULT_TT_BITS)
     }
 
-    /// Like [`Self::new`] but with explicit heuristic toggles (A/B harness).
-    pub fn new_tuned(max_depth: u8, budget: Duration, tuning: Tuning) -> Self {
+    /// Like [`Self::new`] but with explicit heuristic toggles (A/B harness)
+    /// and transposition-table size (`2^tt_bits` entries).
+    pub fn new_tuned(max_depth: u8, budget: Duration, tuning: Tuning, tt_bits: u32) -> Self {
         let nanos = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_nanos() as u64)
@@ -347,7 +402,7 @@ impl SearchEngine {
         SearchEngine {
             max_depth: max_depth.max(1),
             budget,
-            tt: Tt::new(19), // ~512k entries
+            tt: Tt::new(tt_bits.clamp(10, 26)),
             killers: [[None; 2]; MAX_PLY],
             history: Box::new([[0; CELLS]; CELLS]),
             counter: Box::new([[None; CELLS]; CELLS]),
@@ -562,12 +617,20 @@ fn captures_only(board: &Board, moves: Vec<Move>) -> Vec<Move> {
 }
 
 impl SearchEngine {
-    fn quiescence(&mut self, board: &mut Board, side: Color, mut alpha: i32, beta: i32) -> i32 {
+    fn quiescence(
+        &mut self,
+        board: &mut Board,
+        side: Color,
+        mut alpha: i32,
+        beta: i32,
+        mat: i32,
+    ) -> i32 {
         self.nodes += 1;
         if self.time_up() {
             return 0;
         }
-        let stand = evaluate(board, side);
+        debug_assert_eq!(mat, psqt_abs(board), "incremental psqt drift (qsearch)");
+        let stand = if side == Color::Red { mat } else { -mat };
         if stand >= beta {
             return beta;
         }
@@ -584,8 +647,9 @@ impl SearchEngine {
             if self.tuning.see_qprune && see(board, mv) < 0 {
                 continue;
             }
+            let (_, dm) = move_delta(board, mv);
             let captured = board.make(mv);
-            let score = -self.quiescence(board, side.opposite(), -beta, -alpha);
+            let score = -self.quiescence(board, side.opposite(), -beta, -alpha, mat + dm);
             board.unmake(mv, captured);
             if self.aborted {
                 return 0;
@@ -706,14 +770,19 @@ impl SearchEngine {
         beta: i32,
         ply: usize,
         prev: Option<Move>,
+        key: u64,
+        mat: i32,
     ) -> i32 {
         self.nodes += 1;
         if self.time_up() {
             self.path_dep = false;
             return 0;
         }
-
-        let key = zkey(board, side);
+        // Incremental key / psqt are maintained through make/unmake; in debug
+        // builds assert they never drift from a full recompute (the documented
+        // correctness guard for relaxing the full-recompute invariant).
+        debug_assert_eq!(key, zkey(board, side), "incremental Zobrist drift");
+        debug_assert_eq!(mat, psqt_abs(board), "incremental psqt drift");
         // Did the move that led to this node give check (i.e. is the side to
         // move now in check)? Recorded into `path_check` for perpetual-check
         // scoring of repetitions.
@@ -751,7 +820,7 @@ impl SearchEngine {
         }
 
         if depth <= 0 {
-            return self.quiescence(board, side, alpha, beta);
+            return self.quiescence(board, side, alpha, beta, mat);
         }
 
         let mut moves = legal_moves(board, side);
@@ -768,7 +837,11 @@ impl SearchEngine {
         let mate_zone = alpha <= -MATE_THRESHOLD || beta >= MATE_THRESHOLD;
         let prunable = !is_pv && !here_check && !mate_zone;
         let eval = if prunable {
-            evaluate(board, side)
+            if side == Color::Red {
+                mat
+            } else {
+                -mat
+            }
         } else {
             0
         };
@@ -787,7 +860,7 @@ impl SearchEngine {
         // shot could save it — let quiescence confirm a fail-low.
         if self.tuning.razor && prunable && depth <= RAZOR_MAX_DEPTH && eval + RAZOR_MARGIN < alpha
         {
-            let q = self.quiescence(board, side, alpha, beta);
+            let q = self.quiescence(board, side, alpha, beta, mat);
             if self.aborted {
                 self.path_dep = false;
                 return 0;
@@ -810,8 +883,19 @@ impl SearchEngine {
         {
             let r = 2 + depth / 4;
             let nd = (depth - 1 - r).max(0);
-            let nscore =
-                -self.search(board, side.opposite(), nd, -beta, -beta + 1, ply + 1, None);
+            // Null move: only the side-to-move flips (board unchanged), so
+            // the key toggles by `side_xor` and the psqt accumulator is kept.
+            let nscore = -self.search(
+                board,
+                side.opposite(),
+                nd,
+                -beta,
+                -beta + 1,
+                ply + 1,
+                None,
+                key ^ side_xor(),
+                mat,
+            );
             let null_dep = self.path_dep;
             self.path_dep = false;
             if self.aborted {
@@ -860,6 +944,11 @@ impl SearchEngine {
                 continue;
             }
 
+            // Incremental key / psqt for the child (read before the move is
+            // made); restored automatically when `board.unmake` reverts it.
+            let (kx, dm) = move_delta(board, mv);
+            let ckey = key ^ kx;
+            let cmat = mat + dm;
             let captured = board.make(mv);
             let gives_check = in_check(board, side.opposite());
             // Check extension: stay one ply deeper down forcing lines.
@@ -871,7 +960,17 @@ impl SearchEngine {
             let new_depth = depth - 1 + ext;
 
             let score = if first {
-                -self.search(board, side.opposite(), new_depth, -beta, -alpha, ply + 1, Some(mv))
+                -self.search(
+                    board,
+                    side.opposite(),
+                    new_depth,
+                    -beta,
+                    -alpha,
+                    ply + 1,
+                    Some(mv),
+                    ckey,
+                    cmat,
+                )
             } else {
                 // LMR: search late quiet (non-check, non-extended) moves
                 // reduced; only re-search at full depth if they beat alpha.
@@ -895,6 +994,8 @@ impl SearchEngine {
                     -alpha,
                     ply + 1,
                     Some(mv),
+                    ckey,
+                    cmat,
                 );
                 if reduce > 0 && s > alpha {
                     // Reduced search beat alpha — confirm at full depth.
@@ -906,6 +1007,8 @@ impl SearchEngine {
                         -alpha,
                         ply + 1,
                         Some(mv),
+                        ckey,
+                        cmat,
                     );
                 }
                 if s > alpha && s < beta {
@@ -918,6 +1021,8 @@ impl SearchEngine {
                         -alpha,
                         ply + 1,
                         Some(mv),
+                        ckey,
+                        cmat,
                     );
                 }
                 s
@@ -1033,6 +1138,8 @@ impl Engine for SearchEngine {
         // deterministic given the position (no carry-over between turns).
         *self.history = [[0; CELLS]; CELLS];
         *self.counter = [[None; CELLS]; CELLS];
+        // Age the persisted TT so last move's entries don't wedge slots.
+        self.tt.new_generation();
 
         let mut best = root_moves[0];
         let mut best_pool = vec![root_moves[0]];
@@ -1041,6 +1148,7 @@ impl Engine for SearchEngine {
         // seeds the next iteration's ordering via the transposition table.
         for depth in 1..=self.max_depth as i16 {
             let key = zkey(&root_board, side);
+            let mat = psqt_abs(&root_board);
             let tt_move = self.tt.probe(key).and_then(|e| e.best);
             let mut moves = root_moves.clone();
             self.order(&mut root_board, &mut moves, tt_move.or(Some(best)), 0, None);
@@ -1056,6 +1164,7 @@ impl Engine for SearchEngine {
             let mut root_dep = false; // any root line influenced by repetition?
 
             for mv in moves.iter() {
+                let (kx, dm) = move_delta(&root_board, *mv);
                 let captured = root_board.make(*mv);
                 let score = -self.search(
                     &mut root_board,
@@ -1065,6 +1174,8 @@ impl Engine for SearchEngine {
                     INF,
                     1,
                     Some(*mv),
+                    key ^ kx,
+                    mat + dm,
                 );
                 root_board.unmake(*mv, captured);
                 root_dep |= self.path_dep;
@@ -1087,7 +1198,16 @@ impl Engine for SearchEngine {
                 // best (near-best, so still sound) so games don't always start
                 // identically; afterwards require an exact tie, leaving normal
                 // play strength unchanged.
-                let cutoff = if self.tuning.variety && state.history.len() < OPENING_PLIES {
+                // Never widen near a forced mate: mate scores only differ by
+                // their distance, so an 80cp band would lump mate-in-1 with
+                // mate-in-3 and the random pick could throw away the faster
+                // win. Require an exact tie there (still sound, and keeps
+                // shortest-mate play deterministic).
+                let near_mate = best_score.abs() > MATE_THRESHOLD;
+                let cutoff = if self.tuning.variety
+                    && state.history.len() < OPENING_PLIES
+                    && !near_mate
+                {
                     best_score - OPENING_MARGIN
                 } else {
                     best_score

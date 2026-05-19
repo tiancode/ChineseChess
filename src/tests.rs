@@ -463,8 +463,9 @@ fn engine_ab_selfplay() {
         let mut tb = Tuning::baseline();
         tb.variety = false;
         let bud = Duration::from_millis(MOVE_MS);
-        let mut ea = SearchEngine::new_tuned(DEPTH_CAP, bud, ta);
-        let mut eb = SearchEngine::new_tuned(DEPTH_CAP, bud, tb);
+        // Same TT size for both so the match isolates heuristic quality.
+        let mut ea = SearchEngine::new_tuned(DEPTH_CAP, bud, ta, 20);
+        let mut eb = SearchEngine::new_tuned(DEPTH_CAP, bud, tb, 20);
         ea.set_seed(seed);
         eb.set_seed(seed ^ 0x9E37_79B9);
 

@@ -57,14 +57,22 @@ pub fn make_engine(
             // iterative deepening keeps going deeper until the deadline. This
             // is what makes level 5 actually think ~1.5 min instead of
             // finishing a shallow depth in a few seconds.
-            let (depth, ms) = match d {
-                1 => (4, 200),
-                2 => (6, 800),
-                3 => (10, 3_000),
-                4 => (18, 15_000),
-                _ => (28, 90_000),
+            // (depth cap, time ms, TT size 2^bits). Bigger budgets get a
+            // bigger table (~48 B/entry: 2^18≈12 MB … 2^23≈400 MB) so deep
+            // thinking is not throttled by TT thrash.
+            let (depth, ms, tt_bits) = match d {
+                1 => (4, 200, 18),
+                2 => (6, 800, 20),
+                3 => (10, 3_000, 21),
+                4 => (18, 15_000, 22),
+                _ => (28, 90_000, 23),
             };
-            Box::new(search::SearchEngine::new(depth, Duration::from_millis(ms)))
+            Box::new(search::SearchEngine::new_tuned(
+                depth,
+                Duration::from_millis(ms),
+                search::Tuning::full(),
+                tt_bits,
+            ))
         }
         EngineKind::AlphaZero => {
             // AlphaZero strength scales with the MCTS simulation count. Unlike

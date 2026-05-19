@@ -47,12 +47,12 @@ Data/rules layer (`board.rs`, `moves.rs`, `game.rs`) is pure and engine/UI-agnos
 
 ### Two independent, non-shared hashing schemes
 
-This trips people up. They are deliberately separate and **both full-recompute** (no incremental Zobrist update — correctness over speed):
+This trips people up. They are deliberately separate:
 
-- `game.rs::position_hash` — FNV-1a, drives `GameState`'s threefold-repetition detection.
+- `game.rs::position_hash` — FNV-1a, **full-recompute** (correctness over speed), drives `GameState`'s threefold-repetition detection.
 - `ai/search.rs::zkey` — Zobrist, drives the transposition table *and* the engine's own in-search repetition counting (`build_repetition` replays game history into `game_counts`; `path` tracks the current search line).
 
-Changing one does not affect the other.
+The search Zobrist key **and** the material/piece-square score (`psqt_abs`, kept in Red-absolute form) are maintained **incrementally** through the recursion: `move_delta` (read before `board.make`) returns the key XOR and psqt delta, threaded as the `key`/`mat` params of `search`/`quiescence`; a null move toggles only `side_xor()`. `zkey`/`psqt_abs` remain the authoritative full recompute and a `debug_assert_eq!` at every node asserts the incremental values never drift (the correctness guard — run the **debug** test suite to exercise it). Changing one hashing scheme does not affect the other.
 
 ### Pluggable engine
 
