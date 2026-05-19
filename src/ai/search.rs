@@ -26,6 +26,16 @@ const MAX_PLY: usize = 64;
 /// collide with the killer / countermove / capture bands.
 const HISTORY_MAX: i32 = 1 << 20;
 
+// --- Phase 2 selective-search tuning constants ---
+/// Reverse-futility: prune when `eval - RFP_MARGIN*depth >= beta`.
+const RFP_MARGIN: i32 = 80;
+const RFP_MAX_DEPTH: i16 = 6;
+/// Razoring: at depth ≤ 2, if `eval + RAZOR_MARGIN < alpha`, verify by qsearch.
+const RAZOR_MARGIN: i32 = 320;
+const RAZOR_MAX_DEPTH: i16 = 2;
+/// Late move pruning applies at `depth ≤ LMP_MAX_DEPTH`.
+const LMP_MAX_DEPTH: i16 = 3;
+
 /// Plies (half-moves) into the game that still count as "opening". While the
 /// game history is shorter than this, the root widens its equal-best pool so
 /// games do not always start with the identical line.
@@ -49,6 +59,18 @@ pub struct Tuning {
     pub see_order: bool,
     /// Drop SEE-losing captures in quiescence.
     pub see_qprune: bool,
+    /// Reverse futility / static null-move pruning at shallow non-PV nodes.
+    pub rfp: bool,
+    /// Razoring: shallow nodes far below alpha drop straight to quiescence.
+    pub razor: bool,
+    /// Null-move pruning.
+    pub nmp: bool,
+    /// Late move reductions.
+    pub lmr: bool,
+    /// Late move pruning (skip the ordered-last quiets at shallow depth).
+    pub lmp: bool,
+    /// Extend the search one ply on checking moves.
+    pub check_ext: bool,
     /// Widen the opening root pool for move variety. Off in the harness so a
     /// match is deterministic and measures true-best play.
     pub variety: bool,
@@ -62,6 +84,12 @@ impl Tuning {
             countermove: true,
             see_order: true,
             see_qprune: true,
+            rfp: true,
+            razor: true,
+            nmp: true,
+            lmr: true,
+            lmp: true,
+            check_ext: true,
             variety: true,
         }
     }
@@ -76,6 +104,12 @@ impl Tuning {
             countermove: false,
             see_order: false,
             see_qprune: false,
+            rfp: false,
+            razor: false,
+            nmp: false,
+            lmr: false,
+            lmp: false,
+            check_ext: false,
             variety: true,
         }
     }
@@ -424,6 +458,44 @@ fn hist_bump(h: &mut i32, bonus: i32) {
     *h += bonus - *h * bonus.abs() / HISTORY_MAX;
 }
 
+/// True if `side` still has a chariot, cannon, or horse — i.e. real attacking
+/// power, so a null move cannot be a zugzwang trap. (Bare K+A/E has none.)
+fn has_attacking_material(board: &Board, side: Color) -> bool {
+    board.cells.iter().flatten().any(|p| {
+        p.color == side
+            && matches!(
+                p.kind,
+                PieceKind::Chariot | PieceKind::Cannon | PieceKind::Horse
+            )
+    })
+}
+
+/// LMR reduction (in plies) for a late quiet move. Grows with depth and move
+/// index; PV nodes reduce one ply less.
+#[inline]
+fn lmr_reduction(depth: i16, move_idx: usize, is_pv: bool) -> i16 {
+    let mut r: i16 = 1;
+    if depth >= 6 {
+        r += 1;
+    }
+    if move_idx >= 6 {
+        r += 1;
+    }
+    if move_idx >= 12 {
+        r += 1;
+    }
+    if is_pv {
+        r -= 1;
+    }
+    r.max(1)
+}
+
+/// Quiet-move count at a node past which late move pruning kicks in.
+#[inline]
+fn lmp_count(depth: i16) -> usize {
+    (3 + depth * depth) as usize
+}
+
 /// Least-valuable pseudo attacker of `target` for `side`, as the capture move
 /// that brings it there. Uses the authoritative `pseudo_moves` generator so
 /// Xiangqi-specific reachability (horse legs, cannon screens, blocked sliders)
@@ -688,6 +760,69 @@ impl SearchEngine {
             return -MATE + ply as i32;
         }
 
+        // PV vs zero-window node: PVS searches the first child with a full
+        // window and the rest with a null window, so `beta - alpha > 1`
+        // identifies a PV node. Selective pruning is restricted to non-PV
+        // nodes that are not in check and outside the mate zone.
+        let is_pv = beta - alpha > 1;
+        let mate_zone = alpha <= -MATE_THRESHOLD || beta >= MATE_THRESHOLD;
+        let prunable = !is_pv && !here_check && !mate_zone;
+        let eval = if prunable {
+            evaluate(board, side)
+        } else {
+            0
+        };
+
+        // Reverse futility / static null move: so far ahead that even giving
+        // back `RFP_MARGIN` per remaining ply still beats beta.
+        if self.tuning.rfp
+            && prunable
+            && depth <= RFP_MAX_DEPTH
+            && eval - RFP_MARGIN * depth as i32 >= beta
+        {
+            return eval;
+        }
+
+        // Razoring: so far below alpha at shallow depth that only a tactical
+        // shot could save it — let quiescence confirm a fail-low.
+        if self.tuning.razor && prunable && depth <= RAZOR_MAX_DEPTH && eval + RAZOR_MARGIN < alpha
+        {
+            let q = self.quiescence(board, side, alpha, beta);
+            if self.aborted {
+                self.path_dep = false;
+                return 0;
+            }
+            if q < alpha {
+                return q;
+            }
+        }
+
+        // Null-move pruning: pass the move; if the opponent still cannot reach
+        // beta with a reduced search, this node is a fail-high. The null child
+        // pushes its *own* (opponent-to-move) key, so the path stays balanced;
+        // a repetition-tainted null result is distrusted via `path_dep` rather
+        // than trusted as a cutoff (the CCA invariant — see module notes).
+        if self.tuning.nmp
+            && prunable
+            && depth >= 3
+            && eval >= beta
+            && has_attacking_material(board, side)
+        {
+            let r = 2 + depth / 4;
+            let nd = (depth - 1 - r).max(0);
+            let nscore =
+                -self.search(board, side.opposite(), nd, -beta, -beta + 1, ply + 1, None);
+            let null_dep = self.path_dep;
+            self.path_dep = false;
+            if self.aborted {
+                return 0;
+            }
+            if !null_dep && nscore >= beta {
+                // A null search cannot prove a real mate; clamp to beta there.
+                return if nscore >= MATE_THRESHOLD { beta } else { nscore };
+            }
+        }
+
         let tt_move = self.tt.probe(key).and_then(|e| e.best);
         self.order(board, &mut moves, tt_move, ply, prev);
 
@@ -696,6 +831,7 @@ impl SearchEngine {
         let mut best_score = -INF;
         let mut best_move = None;
         let mut first = true;
+        let mut move_idx: usize = 0;
         // Quiet moves already tried at this node (for the history malus on a
         // later cutoff). Captures are excluded — history is a quiet-move stat.
         let mut quiets: Vec<Move> = Vec::new();
@@ -705,36 +841,90 @@ impl SearchEngine {
         let mut subtree_dep = false;
 
         for mv in moves {
+            // `quiet` is decided before the move is made (a piece on the
+            // destination ⇒ capture); history/killers and the LMR/LMP gates
+            // are quiet-move stats only.
+            let quiet = board.get(mv.to).is_none();
+
+            // Late move pruning: at shallow non-PV nodes, once enough moves
+            // have been tried, skip the ordered-last quiets. Never while in
+            // check, and not before a non-losing score exists (mate defence).
+            if self.tuning.lmp
+                && prunable
+                && quiet
+                && depth <= LMP_MAX_DEPTH
+                && move_idx >= lmp_count(depth)
+                && best_score > -MATE_THRESHOLD
+            {
+                move_idx += 1;
+                continue;
+            }
+
             let captured = board.make(mv);
-            let score = if first {
-                -self.search(board, side.opposite(), depth - 1, -beta, -alpha, ply + 1, Some(mv))
+            let gives_check = in_check(board, side.opposite());
+            // Check extension: stay one ply deeper down forcing lines.
+            let ext: i16 = if self.tuning.check_ext && gives_check && ply < MAX_PLY {
+                1
             } else {
-                // PVS: null-window probe, re-search on a fail-high.
-                let s = -self.search(
+                0
+            };
+            let new_depth = depth - 1 + ext;
+
+            let score = if first {
+                -self.search(board, side.opposite(), new_depth, -beta, -alpha, ply + 1, Some(mv))
+            } else {
+                // LMR: search late quiet (non-check, non-extended) moves
+                // reduced; only re-search at full depth if they beat alpha.
+                let reduce = if self.tuning.lmr
+                    && quiet
+                    && !gives_check
+                    && ext == 0
+                    && depth >= 3
+                    && move_idx >= 3
+                {
+                    lmr_reduction(depth, move_idx, is_pv)
+                } else {
+                    0
+                };
+                let d = (new_depth - reduce).max(1);
+                let mut s = -self.search(
                     board,
                     side.opposite(),
-                    depth - 1,
+                    d,
                     -alpha - 1,
                     -alpha,
                     ply + 1,
                     Some(mv),
                 );
-                if s > alpha && s < beta {
-                    -self.search(
+                if reduce > 0 && s > alpha {
+                    // Reduced search beat alpha — confirm at full depth.
+                    s = -self.search(
                         board,
                         side.opposite(),
-                        depth - 1,
+                        new_depth,
+                        -alpha - 1,
+                        -alpha,
+                        ply + 1,
+                        Some(mv),
+                    );
+                }
+                if s > alpha && s < beta {
+                    // PV: re-search with the full window.
+                    s = -self.search(
+                        board,
+                        side.opposite(),
+                        new_depth,
                         -beta,
                         -alpha,
                         ply + 1,
                         Some(mv),
-                    )
-                } else {
-                    s
+                    );
                 }
+                s
             };
             board.unmake(mv, captured);
             first = false;
+            move_idx += 1;
             // The child set `self.path_dep` on return; fold it in.
             subtree_dep |= self.path_dep;
 
@@ -751,9 +941,6 @@ impl SearchEngine {
             if score > alpha {
                 alpha = score;
             }
-            // Board is restored here, so a piece on `mv.to` ⇒ this was a
-            // capture; history/killers/countermove are quiet-move stats only.
-            let quiet = board.get(mv.to).is_none();
             if alpha >= beta {
                 if quiet {
                     if ply < MAX_PLY {
