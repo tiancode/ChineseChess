@@ -405,6 +405,144 @@ fn engine_benchmark() {
     }
 }
 
+/// A/B strength gate. Pits the upgraded engine (`Tuning::full`) against the
+/// pre-upgrade reference (`Tuning::baseline`) over a small book of distinct
+/// openings, colours swapped, at a fixed per-move time budget. Prints the
+/// score and an Elo estimate; the acceptance rule per phase is "non-negative,
+/// and clearly positive for Phase 2 / 4".
+///
+/// Not run by default (timing-dependent, ~1-2 min):
+/// `cargo test --release engine_ab_selfplay -- --ignored --nocapture`
+#[test]
+#[ignore]
+fn engine_ab_selfplay() {
+    use crate::ai::search::{SearchEngine, Tuning};
+    use std::time::Duration;
+
+    const MOVE_MS: u64 = 50; // per-move wall clock for both engines
+    const DEPTH_CAP: u8 = 64; // time is the real limiter
+    const MAX_PLIES: usize = 200; // adjudicate marathon games as a draw
+
+    // Distinct, legal opening stems: indices into the legal-move list at each
+    // ply (mod len), so positions diverge while staying sound. Empty = the
+    // standard start.
+    let openings: &[&[usize]] = &[
+        &[],
+        &[0],
+        &[5],
+        &[12],
+        &[20],
+        &[0, 0],
+        &[7, 3],
+        &[15, 9],
+    ];
+
+    fn winner_of(st: GameStatus) -> Option<Option<Color>> {
+        // Some(Some(c)) = c won; Some(None) = draw; None = not terminal.
+        match st {
+            GameStatus::Win(c) | GameStatus::Stalemate(c) => Some(Some(c)),
+            GameStatus::PerpetualLoss { winner, .. } => Some(Some(winner)),
+            GameStatus::Draw(_) => Some(None),
+            GameStatus::Ongoing | GameStatus::Check(_) => None,
+        }
+    }
+
+    // One game. Returns A's points ×2 (win=2, draw=1, loss=0).
+    fn play(opening: &[usize], a_is_red: bool, seed: u64) -> i32 {
+        let mut g = GameState::new();
+        for &pick in opening {
+            let lm = g.legal_moves();
+            if lm.is_empty() {
+                break;
+            }
+            g.apply(lm[pick % lm.len()]);
+        }
+
+        let mut ta = Tuning::full();
+        ta.variety = false; // deterministic: measure true-best play
+        let mut tb = Tuning::baseline();
+        tb.variety = false;
+        let bud = Duration::from_millis(MOVE_MS);
+        let mut ea = SearchEngine::new_tuned(DEPTH_CAP, bud, ta);
+        let mut eb = SearchEngine::new_tuned(DEPTH_CAP, bud, tb);
+        ea.set_seed(seed);
+        eb.set_seed(seed ^ 0x9E37_79B9);
+
+        loop {
+            if let Some(res) = winner_of(g.status()) {
+                return match res {
+                    None => 1,
+                    Some(c) => {
+                        if (c == Color::Red) == a_is_red {
+                            2
+                        } else {
+                            0
+                        }
+                    }
+                };
+            }
+            if g.history.len() >= MAX_PLIES {
+                return 1; // drawn by adjudication
+            }
+            let a_to_move = (g.side_to_move == Color::Red) == a_is_red;
+            let mv = if a_to_move {
+                ea.best_move(&g)
+            } else {
+                eb.best_move(&g)
+            };
+            match mv {
+                Some(m) => g.apply(m),
+                None => {
+                    // No move = side to move loses (status() agrees next loop).
+                    return if a_to_move { 0 } else { 2 };
+                }
+            }
+        }
+    }
+
+    let mut pts2 = 0i32; // A points ×2
+    let mut games = 0i32;
+    let (mut w, mut d, mut l) = (0i32, 0i32, 0i32);
+    for (gi, op) in openings.iter().enumerate() {
+        for (ci, &a_is_red) in [true, false].iter().enumerate() {
+            let seed = 0x1234_5678 ^ ((gi as u64) << 8) ^ (ci as u64);
+            let r = play(op, a_is_red, seed);
+            pts2 += r;
+            games += 1;
+            match r {
+                2 => w += 1,
+                1 => d += 1,
+                _ => l += 1,
+            }
+            println!(
+                "game {games:>2}: opening {op:?} A={} -> {}",
+                if a_is_red { "Red" } else { "Black" },
+                match r {
+                    2 => "A win",
+                    1 => "draw",
+                    _ => "B win",
+                }
+            );
+        }
+    }
+
+    let score = pts2 as f64 / (2.0 * games as f64); // A's score fraction
+    let elo = if score <= 0.0 {
+        f64::NEG_INFINITY
+    } else if score >= 1.0 {
+        f64::INFINITY
+    } else {
+        -400.0 * (1.0 / score - 1.0).log10()
+    };
+    println!(
+        "\nA(full) vs B(baseline): +{w} ={d} -{l} of {games}  score={score:.3}  Elo≈{elo:+.0}"
+    );
+    assert!(
+        pts2 >= games,
+        "upgraded engine must not regress vs baseline (score {score:.3} < 0.500)"
+    );
+}
+
 #[test]
 fn engine_finds_mate_in_one() {
     // Red to move; Cd-e1 style: sliding the chariot to (5,1) mates the bare

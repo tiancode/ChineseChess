@@ -12,7 +12,7 @@ use std::time::{Duration, Instant};
 use super::Engine;
 use crate::board::*;
 use crate::game::GameState;
-use crate::moves::{in_check, legal_moves};
+use crate::moves::{in_check, legal_moves, pseudo_moves};
 // Single source of truth for piece values: the engine's material term and the
 // repetition rules' chase test must agree on the scale.
 use crate::moves::piece_value as base_value;
@@ -21,6 +21,10 @@ const INF: i32 = 32_001;
 const MATE: i32 = 30_000;
 const MATE_THRESHOLD: i32 = MATE - 256;
 const MAX_PLY: usize = 64;
+/// Butterfly-history saturation bound. The gravity update keeps every entry
+/// strictly inside (-HISTORY_MAX, HISTORY_MAX), so quiet ordering scores never
+/// collide with the killer / countermove / capture bands.
+const HISTORY_MAX: i32 = 1 << 20;
 
 /// Plies (half-moves) into the game that still count as "opening". While the
 /// game history is shorter than this, the root widens its equal-best pool so
@@ -30,6 +34,52 @@ const OPENING_PLIES: usize = 8;
 /// best joins the random-pick pool (a soldier is worth 100). Picked moves are
 /// near-best, so play stays sound; afterwards an exact tie is required.
 const OPENING_MARGIN: i32 = 80;
+
+/// Feature toggles for the search heuristics. Real play uses [`Tuning::full`];
+/// the A/B self-play harness pits it against [`Tuning::baseline`] (the
+/// pre-upgrade behaviour) to measure each phase's Elo before it is accepted.
+#[derive(Clone, Copy)]
+pub struct Tuning {
+    /// Order quiet moves by butterfly history (else a flat 0, original order).
+    pub history: bool,
+    /// Use the countermove reply band in ordering.
+    pub countermove: bool,
+    /// Classify captures winning/losing by SEE (else all captures rank ahead
+    /// of quiets by MVV-LVA, as the original engine did).
+    pub see_order: bool,
+    /// Drop SEE-losing captures in quiescence.
+    pub see_qprune: bool,
+    /// Widen the opening root pool for move variety. Off in the harness so a
+    /// match is deterministic and measures true-best play.
+    pub variety: bool,
+}
+
+impl Tuning {
+    /// Everything the upgraded engine knows (production default).
+    pub fn full() -> Self {
+        Tuning {
+            history: true,
+            countermove: true,
+            see_order: true,
+            see_qprune: true,
+            variety: true,
+        }
+    }
+
+    /// The pre-upgrade engine: TT move + MVV-LVA captures + killers only, all
+    /// captures searched in quiescence. The fixed reference opponent (used
+    /// only by the `#[ignore]` A/B harness, hence allowed-dead in normal builds).
+    #[allow(dead_code)]
+    pub fn baseline() -> Self {
+        Tuning {
+            history: false,
+            countermove: false,
+            see_order: false,
+            see_qprune: false,
+            variety: true,
+        }
+    }
+}
 
 // ----------------------------------------------------------------------------
 // Zobrist hashing (full recompute per node: O(90), simple and bug-free).
@@ -222,6 +272,13 @@ pub struct SearchEngine {
     budget: Duration,
     tt: Tt,
     killers: [[Option<Move>; 2]; MAX_PLY],
+    /// Butterfly history: quiet-move cutoff counters indexed [from][to].
+    /// Boxed so the ~32 KB table is heap-allocated, not on the search stack.
+    history: Box<[[i32; CELLS]; CELLS]>,
+    /// Countermove table: indexed by the opponent's previous move [from][to],
+    /// the quiet reply that last produced a cutoff against it.
+    counter: Box<[[Option<Move>; CELLS]; CELLS]>,
+    tuning: Tuning,
     rng: u64,
     // Set per search:
     deadline: Instant,
@@ -243,6 +300,11 @@ pub struct SearchEngine {
 
 impl SearchEngine {
     pub fn new(max_depth: u8, budget: Duration) -> Self {
+        SearchEngine::new_tuned(max_depth, budget, Tuning::full())
+    }
+
+    /// Like [`Self::new`] but with explicit heuristic toggles (A/B harness).
+    pub fn new_tuned(max_depth: u8, budget: Duration, tuning: Tuning) -> Self {
         let nanos = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_nanos() as u64)
@@ -253,6 +315,9 @@ impl SearchEngine {
             budget,
             tt: Tt::new(19), // ~512k entries
             killers: [[None; 2]; MAX_PLY],
+            history: Box::new([[0; CELLS]; CELLS]),
+            counter: Box::new([[None; CELLS]; CELLS]),
+            tuning,
             rng: if seed == 0 { 0x9E37_79B9_7F4A_7C15 } else { seed },
             deadline: Instant::now(),
             nodes: 0,
@@ -268,6 +333,12 @@ impl SearchEngine {
     #[cfg(test)]
     pub fn fixed_depth(depth: u8) -> Self {
         SearchEngine::new(depth, Duration::from_secs(3600))
+    }
+
+    /// Pin the variety RNG so an A/B match is byte-for-byte reproducible.
+    #[cfg(test)]
+    pub fn set_seed(&mut self, s: u64) {
+        self.rng = if s == 0 { 0x9E37_79B9_7F4A_7C15 } else { s };
     }
 
     /// Nodes visited by the last `best_move` (benchmarking).
@@ -337,26 +408,77 @@ impl SearchEngine {
     }
 }
 
-/// Order: TT move, then captures by MVV-LVA, then killers, then the rest.
-fn order_moves(
-    board: &Board,
-    moves: &mut [Move],
-    tt_move: Option<Move>,
-    killers: &[Option<Move>; 2],
-) {
-    moves.sort_by_key(|m| {
-        if Some(*m) == tt_move {
-            return -1_000_000;
+/// MVV-LVA score for a capture (victim heavily outweighs attacker).
+#[inline]
+fn mvv_lva(board: &Board, m: Move) -> i32 {
+    let victim = board.get(m.to).map(|p| base_value(p.kind)).unwrap_or(0);
+    let attacker = board.get(m.from).map(|p| base_value(p.kind)).unwrap_or(0);
+    victim * 16 - attacker
+}
+
+/// History "gravity" update: pulls the entry toward ±HISTORY_MAX by `bonus`
+/// (positive on a cutoff, negative as a malus) while staying bounded, so no
+/// periodic rescale is needed.
+#[inline]
+fn hist_bump(h: &mut i32, bonus: i32) {
+    *h += bonus - *h * bonus.abs() / HISTORY_MAX;
+}
+
+/// Least-valuable pseudo attacker of `target` for `side`, as the capture move
+/// that brings it there. Uses the authoritative `pseudo_moves` generator so
+/// Xiangqi-specific reachability (horse legs, cannon screens, blocked sliders)
+/// is exact and there is no second, divergent attack table to maintain.
+fn least_valuable_attacker(board: &Board, target: usize, side: Color) -> Option<Move> {
+    let mut best: Option<(i32, Move)> = None;
+    for m in pseudo_moves(board, side) {
+        if m.to != target {
+            continue;
         }
-        if let Some(victim) = board.get(m.to) {
-            let attacker = board.get(m.from).map(|p| base_value(p.kind)).unwrap_or(0);
-            return -(100_000 + base_value(victim.kind) * 16 - attacker);
+        if let Some(p) = board.get(m.from) {
+            let v = base_value(p.kind);
+            if best.is_none_or(|(bv, _)| v < bv) {
+                best = Some((v, m));
+            }
         }
-        if Some(*m) == killers[0] || Some(*m) == killers[1] {
-            return -50_000;
-        }
-        0
-    });
+    }
+    best.map(|(_, m)| m)
+}
+
+/// Recursive half of SEE: `side` is on move and may capture the piece now
+/// standing on `target` with its least valuable attacker, or decline (max 0).
+/// Restores the board exactly (every `make` is paired with an `unmake`).
+fn see_recapture(board: &mut Board, target: usize, side: Color) -> i32 {
+    let Some(mv) = least_valuable_attacker(board, target, side) else {
+        return 0;
+    };
+    let victim = base_value(board.get(target).expect("occupied during SEE").kind);
+    let cap = board.make(mv);
+    let val = (victim - see_recapture(board, target, side.opposite())).max(0);
+    board.unmake(mv, cap);
+    val
+}
+
+/// Static Exchange Evaluation of a capture: material the mover nets if the
+/// full capture sequence on `mv.to` is played out with least-valuable
+/// attackers, each side free to stop. Pins/self-check are ignored (standard
+/// SEE); piece values come from `base_value` (single source of truth).
+fn see(board: &mut Board, mv: Move) -> i32 {
+    let Some(victim) = board.get(mv.to) else {
+        return 0; // not a capture
+    };
+    let Some(mover) = board.get(mv.from).map(|p| p.color) else {
+        return 0;
+    };
+    let vval = base_value(victim.kind);
+    let cap = board.make(mv);
+    let s = vval - see_recapture(board, mv.to, mover.opposite());
+    board.unmake(mv, cap);
+    s
+}
+
+/// Order quiescence captures by MVV-LVA (SEE pruning is applied in the loop).
+fn order_captures(board: &Board, moves: &mut [Move]) {
+    moves.sort_by_key(|m| -mvv_lva(board, *m));
 }
 
 #[inline]
@@ -383,8 +505,13 @@ impl SearchEngine {
 
         let pseudo = legal_moves(board, side);
         let mut caps = captures_only(board, pseudo);
-        order_moves(board, &mut caps, None, &[None, None]);
+        order_captures(board, &mut caps);
         for mv in caps {
+            // Skip captures that lose material by static exchange: they cannot
+            // raise alpha above the stand-pat and only inflate the q-tree.
+            if self.tuning.see_qprune && see(board, mv) < 0 {
+                continue;
+            }
             let captured = board.make(mv);
             let score = -self.quiescence(board, side.opposite(), -beta, -alpha);
             board.unmake(mv, captured);
@@ -441,6 +568,62 @@ impl SearchEngine {
         }
     }
 
+    /// Full move ordering for an interior node: TT move, winning/equal
+    /// captures (SEE ≥ 0) by MVV-LVA, the two killers, the countermove for
+    /// `prev`, quiet moves by butterfly history, then losing captures last.
+    fn order(
+        &self,
+        board: &mut Board,
+        moves: &mut [Move],
+        tt_move: Option<Move>,
+        ply: usize,
+        prev: Option<Move>,
+    ) {
+        let killers = if ply < MAX_PLY {
+            self.killers[ply]
+        } else {
+            [None, None]
+        };
+        let cm = if self.tuning.countermove {
+            prev.and_then(|p| self.counter[p.from][p.to])
+        } else {
+            None
+        };
+        let mut keyed: Vec<(i32, Move)> = Vec::with_capacity(moves.len());
+        for &m in moves.iter() {
+            let s = if Some(m) == tt_move {
+                -3_000_000
+            } else if board.get(m.to).is_some() {
+                let mvv = mvv_lva(board, m);
+                if self.tuning.see_order {
+                    let sx = see(board, m);
+                    if sx >= 0 {
+                        -2_000_000 - mvv // winning / equal capture
+                    } else {
+                        2_000_000 - sx // losing capture: dead last
+                    }
+                } else {
+                    -2_000_000 - mvv // original: all captures ahead of quiets
+                }
+            } else if Some(m) == killers[0] {
+                -1_900_000
+            } else if Some(m) == killers[1] {
+                -1_800_000
+            } else if Some(m) == cm {
+                -1_700_000
+            } else if self.tuning.history {
+                -self.history[m.from][m.to]
+            } else {
+                0
+            };
+            keyed.push((s, m));
+        }
+        keyed.sort_by_key(|&(s, _)| s);
+        for (slot, (_, m)) in moves.iter_mut().zip(keyed) {
+            *slot = m;
+        }
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn search(
         &mut self,
@@ -450,6 +633,7 @@ impl SearchEngine {
         mut alpha: i32,
         beta: i32,
         ply: usize,
+        prev: Option<Move>,
     ) -> i32 {
         self.nodes += 1;
         if self.time_up() {
@@ -505,18 +689,16 @@ impl SearchEngine {
         }
 
         let tt_move = self.tt.probe(key).and_then(|e| e.best);
-        let killers = if ply < MAX_PLY {
-            self.killers[ply]
-        } else {
-            [None, None]
-        };
-        order_moves(board, &mut moves, tt_move, &killers);
+        self.order(board, &mut moves, tt_move, ply, prev);
 
         self.path.push(key);
         self.path_check.push(here_check);
         let mut best_score = -INF;
         let mut best_move = None;
         let mut first = true;
+        // Quiet moves already tried at this node (for the history malus on a
+        // later cutoff). Captures are excluded — history is a quiet-move stat.
+        let mut quiets: Vec<Move> = Vec::new();
         // OR of every searched child's path-dependence flag. If set, this
         // node's value was influenced by a repetition score and must not be
         // cached in the position-keyed TT.
@@ -525,7 +707,7 @@ impl SearchEngine {
         for mv in moves {
             let captured = board.make(mv);
             let score = if first {
-                -self.search(board, side.opposite(), depth - 1, -beta, -alpha, ply + 1)
+                -self.search(board, side.opposite(), depth - 1, -beta, -alpha, ply + 1, Some(mv))
             } else {
                 // PVS: null-window probe, re-search on a fail-high.
                 let s = -self.search(
@@ -535,9 +717,18 @@ impl SearchEngine {
                     -alpha - 1,
                     -alpha,
                     ply + 1,
+                    Some(mv),
                 );
                 if s > alpha && s < beta {
-                    -self.search(board, side.opposite(), depth - 1, -beta, -alpha, ply + 1)
+                    -self.search(
+                        board,
+                        side.opposite(),
+                        depth - 1,
+                        -beta,
+                        -alpha,
+                        ply + 1,
+                        Some(mv),
+                    )
                 } else {
                     s
                 }
@@ -560,16 +751,31 @@ impl SearchEngine {
             if score > alpha {
                 alpha = score;
             }
+            // Board is restored here, so a piece on `mv.to` ⇒ this was a
+            // capture; history/killers/countermove are quiet-move stats only.
+            let quiet = board.get(mv.to).is_none();
             if alpha >= beta {
-                // Beta cutoff: remember quiet killer moves.
-                if board.get(mv.to).is_none() && ply < MAX_PLY {
-                    let k = &mut self.killers[ply];
-                    if k[0] != Some(mv) {
-                        k[1] = k[0];
-                        k[0] = Some(mv);
+                if quiet {
+                    if ply < MAX_PLY {
+                        let k = &mut self.killers[ply];
+                        if k[0] != Some(mv) {
+                            k[1] = k[0];
+                            k[0] = Some(mv);
+                        }
+                    }
+                    if let Some(p) = prev {
+                        self.counter[p.from][p.to] = Some(mv);
+                    }
+                    let bonus = (depth as i32) * (depth as i32);
+                    hist_bump(&mut self.history[mv.from][mv.to], bonus);
+                    for q in &quiets {
+                        hist_bump(&mut self.history[q.from][q.to], -bonus);
                     }
                 }
                 break;
+            }
+            if quiet {
+                quiets.push(mv);
             }
         }
         self.path.pop();
@@ -636,6 +842,10 @@ impl Engine for SearchEngine {
         self.nodes = 0;
         self.aborted = false;
         self.killers = [[None; 2]; MAX_PLY];
+        // Quiet-move ordering stats start fresh each move so play stays
+        // deterministic given the position (no carry-over between turns).
+        *self.history = [[0; CELLS]; CELLS];
+        *self.counter = [[None; CELLS]; CELLS];
 
         let mut best = root_moves[0];
         let mut best_pool = vec![root_moves[0]];
@@ -646,7 +856,7 @@ impl Engine for SearchEngine {
             let key = zkey(&root_board, side);
             let tt_move = self.tt.probe(key).and_then(|e| e.best);
             let mut moves = root_moves.clone();
-            order_moves(&root_board, &mut moves, tt_move.or(Some(best)), &[None, None]);
+            self.order(&mut root_board, &mut moves, tt_move.or(Some(best)), 0, None);
 
             // Root is searched with a full window per move so the scores are
             // exact: this keeps the equal-best pool honest (a null-window /
@@ -660,8 +870,15 @@ impl Engine for SearchEngine {
 
             for mv in moves.iter() {
                 let captured = root_board.make(*mv);
-                let score =
-                    -self.search(&mut root_board, side.opposite(), depth - 1, -INF, INF, 1);
+                let score = -self.search(
+                    &mut root_board,
+                    side.opposite(),
+                    depth - 1,
+                    -INF,
+                    INF,
+                    1,
+                    Some(*mv),
+                );
                 root_board.unmake(*mv, captured);
                 root_dep |= self.path_dep;
 
@@ -683,7 +900,7 @@ impl Engine for SearchEngine {
                 // best (near-best, so still sound) so games don't always start
                 // identically; afterwards require an exact tie, leaving normal
                 // play strength unchanged.
-                let cutoff = if state.history.len() < OPENING_PLIES {
+                let cutoff = if self.tuning.variety && state.history.len() < OPENING_PLIES {
                     best_score - OPENING_MARGIN
                 } else {
                     best_score
@@ -708,5 +925,83 @@ impl Engine for SearchEngine {
         // Vary play among equally-best moves.
         let pick = (self.next_rand() as usize) % best_pool.len();
         Some(best_pool.get(pick).copied().unwrap_or(best))
+    }
+}
+
+#[cfg(test)]
+mod see_tests {
+    //! Static Exchange Evaluation on hand-built positions. Coordinates are in
+    //! Red orientation (rank 9 = Red home, rank 0 = Black home); piece values
+    //! come from `base_value` (Chariot 1000, Soldier 100).
+    use super::*;
+
+    fn put(b: &mut Board, f: i32, r: i32, kind: PieceKind, color: Color) {
+        b.cells[idx(f, r)] = Some(Piece { kind, color });
+    }
+    fn mv(f0: i32, r0: i32, f1: i32, r1: i32) -> Move {
+        Move { from: idx(f0, r0), to: idx(f1, r1) }
+    }
+
+    /// Generals parked in their palaces, off file 4, so they never attack the
+    /// exchange square and `pseudo_moves` always has a side to enumerate.
+    fn with_generals(b: &mut Board) {
+        put(b, 3, 9, PieceKind::General, Color::Red);
+        put(b, 5, 0, PieceKind::General, Color::Black);
+    }
+
+    #[test]
+    fn undefended_capture_wins_the_victim() {
+        let mut b = Board::empty();
+        with_generals(&mut b);
+        put(&mut b, 4, 5, PieceKind::Chariot, Color::Red);
+        put(&mut b, 4, 3, PieceKind::Soldier, Color::Black); // undefended
+        assert_eq!(see(&mut b, mv(4, 5, 4, 3)), 100);
+    }
+
+    #[test]
+    fn rook_takes_pawn_defended_by_rook_is_losing() {
+        let mut b = Board::empty();
+        with_generals(&mut b);
+        put(&mut b, 4, 5, PieceKind::Chariot, Color::Red);
+        put(&mut b, 4, 3, PieceKind::Soldier, Color::Black);
+        put(&mut b, 4, 1, PieceKind::Chariot, Color::Black); // recaptures
+        // +100 (pawn) − 1000 (own rook lost) = −900.
+        assert_eq!(see(&mut b, mv(4, 5, 4, 3)), -900);
+    }
+
+    #[test]
+    fn equal_rook_trade_is_zero() {
+        let mut b = Board::empty();
+        with_generals(&mut b);
+        put(&mut b, 4, 5, PieceKind::Chariot, Color::Red);
+        put(&mut b, 4, 3, PieceKind::Chariot, Color::Black);
+        put(&mut b, 4, 1, PieceKind::Chariot, Color::Black); // recaptures
+        assert_eq!(see(&mut b, mv(4, 5, 4, 3)), 0);
+    }
+
+    #[test]
+    fn recapturer_declines_when_recapture_loses() {
+        // Red Sx pawn; Black rook *could* recapture but a Red rook x-rays
+        // behind it, so taking back loses the rook — Black declines and the
+        // exchange nets Red the pawn.
+        let mut b = Board::empty();
+        with_generals(&mut b);
+        put(&mut b, 4, 4, PieceKind::Soldier, Color::Red);
+        put(&mut b, 4, 3, PieceKind::Soldier, Color::Black);
+        put(&mut b, 4, 1, PieceKind::Chariot, Color::Black);
+        put(&mut b, 4, 0, PieceKind::Chariot, Color::Red); // x-ray defender
+        assert_eq!(see(&mut b, mv(4, 4, 4, 3)), 100);
+    }
+
+    #[test]
+    fn see_restores_the_board_exactly() {
+        let mut b = Board::empty();
+        with_generals(&mut b);
+        put(&mut b, 4, 5, PieceKind::Chariot, Color::Red);
+        put(&mut b, 4, 3, PieceKind::Soldier, Color::Black);
+        put(&mut b, 4, 1, PieceKind::Chariot, Color::Black);
+        let before = b.cells;
+        let _ = see(&mut b, mv(4, 5, 4, 3));
+        assert!(b.cells == before, "SEE must leave the board untouched");
     }
 }
