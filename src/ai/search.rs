@@ -203,7 +203,16 @@ const MOVE_NONE: u16 = u16::MAX;
 #[inline]
 fn enc_move(m: Option<Move>) -> u16 {
     match m {
-        Some(mv) => (mv.from as u16) * 90 + mv.to as u16, // 0..8099
+        Some(mv) => {
+            let code = (mv.from as u16) * 90 + mv.to as u16; // 0..8099
+            debug_assert!(
+                code < MOVE_NONE,
+                "move code {code} out of range (from {} to {})",
+                mv.from,
+                mv.to
+            );
+            code
+        }
         None => MOVE_NONE,
     }
 }
@@ -1215,11 +1224,16 @@ impl SearchEngine {
 
         // Hard recursion bound. A check extension keeps `depth` constant down
         // a forcing line, so without this cap a long (non-repeating) checking
-        // sequence recurses until the stack overflows. Fall back to a static
-        // (quiescence) score — `path_dep` is already cleared, and the
-        // perpetual-check repetition test above has already had its say.
+        // sequence recurses until the stack overflows. `path_dep` is already
+        // cleared and the perpetual-check repetition test above has had its
+        // say. In check, quiescence (captures only) would miss forced
+        // evasions, so use the static eval there instead.
         if ply >= MAX_PLY {
-            return self.quiescence(board, side, alpha, beta, mat);
+            return if here_check {
+                evaluate(board, side, mat)
+            } else {
+                self.quiescence(board, side, alpha, beta, mat)
+            };
         }
 
         let alpha_orig = alpha;
