@@ -79,6 +79,8 @@ pub struct Tuning {
     /// Widen the opening root pool for move variety. Off in the harness so a
     /// match is deterministic and measures true-best play.
     pub variety: bool,
+    /// Play from the small principled opening book on move one.
+    pub book: bool,
 }
 
 impl Tuning {
@@ -96,6 +98,7 @@ impl Tuning {
             lmp: true,
             check_ext: true,
             variety: true,
+            book: true,
         }
     }
 
@@ -116,6 +119,7 @@ impl Tuning {
             lmp: false,
             check_ext: false,
             variety: true,
+            book: false,
         }
     }
 }
@@ -611,14 +615,56 @@ fn positional_abs(board: &Board) -> i32 {
         }
     }
 
+    // Endgame: when the opponent has no mating material, drive our heavy
+    // pieces toward their (now nearly bare) general to convert the win.
+    for &c in &[Color::Red, Color::Black] {
+        let opp = c.opposite();
+        if has_mating_material(board, opp) {
+            continue;
+        }
+        if let Some(g) = general_sq(board, opp) {
+            let (gf, gr) = (file_of(g), rank_of(g));
+            for (sq, cell) in board.cells.iter().enumerate() {
+                if let Some(p) = cell {
+                    if p.color == c && matches!(p.kind, PieceKind::Chariot | PieceKind::Cannon) {
+                        let d = (file_of(sq) - gf).abs() + (rank_of(sq) - gr).abs();
+                        add(c, (14 - d).max(0));
+                    }
+                }
+            }
+        }
+    }
+
     acc
+}
+
+/// Can `color` actually force mate? Needs a chariot/cannon/horse or a soldier
+/// that has crossed the river. (A bare K + advisors/elephants never can.)
+fn has_mating_material(board: &Board, color: Color) -> bool {
+    board.cells.iter().enumerate().any(|(sq, cell)| {
+        cell.is_some_and(|p| {
+            p.color == color
+                && match p.kind {
+                    PieceKind::Chariot | PieceKind::Cannon | PieceKind::Horse => true,
+                    PieceKind::Soldier => crossed_river(color, rank_of(sq)),
+                    _ => false,
+                }
+        })
+    })
 }
 
 /// Static evaluation from `side`'s perspective: incremental material+PST
 /// (`mat`, Red-absolute) plus the recomputed positional terms, oriented.
+/// Endgame correctness: a material lead by a side that cannot mate is
+/// damped hard toward a draw (e.g. lone K+双士 vs K).
 #[inline]
 fn evaluate(board: &Board, side: Color, mat: i32) -> i32 {
-    let abs = mat + positional_abs(board);
+    let mut abs = mat + positional_abs(board);
+    let leader_cannot_mate = (abs > 0 && !has_mating_material(board, Color::Red))
+        || (abs < 0 && !has_mating_material(board, Color::Black));
+    if leader_cannot_mate {
+        abs /= 4;
+    }
     if side == Color::Red {
         abs
     } else {
@@ -1476,6 +1522,14 @@ impl Engine for SearchEngine {
             return Some(root_moves[0]);
         }
 
+        // Opening book: a sound, instant first move (saves clock, adds
+        // principled variety). Only ever fires on move one.
+        if self.tuning.book {
+            if let Some(m) = crate::ai::book::book_move(state, self.next_rand()) {
+                return Some(m);
+            }
+        }
+
         self.build_repetition(state);
         self.path.clear();
         self.path_check.clear();
@@ -1794,6 +1848,45 @@ mod eval_tests {
             "窝心马 penalty: {} vs {}",
             positional_abs(&center),
             positional_abs(&normal)
+        );
+    }
+
+    #[test]
+    fn cannot_mate_is_damped_toward_draw() {
+        // Red K + 双士 vs lone Black K: materially "ahead" but cannot mate.
+        let mut b = Board::empty();
+        kings(&mut b);
+        put(&mut b, 3, 9, PieceKind::Advisor, Color::Red);
+        put(&mut b, 5, 9, PieceKind::Advisor, Color::Red);
+        let mat = psqt_abs(&b);
+        let damped = evaluate(&b, Color::Red, mat);
+        assert!(mat > 300 && damped < mat / 2, "no-mate lead must damp: {mat} -> {damped}");
+        // Give Red a chariot (real mating material): no longer damped.
+        let mut c = b;
+        put(&mut c, 0, 9, PieceKind::Chariot, Color::Red);
+        let cm = psqt_abs(&c);
+        assert!(
+            evaluate(&c, Color::Red, cm) > damped + 500,
+            "mating material must not be damped"
+        );
+    }
+
+    #[test]
+    fn book_returns_a_sound_first_move_then_stops() {
+        let g = GameState::new();
+        let m = crate::ai::book::book_move(&g, 12345).expect("a book move at the start");
+        let p = g.board.get(m.from).expect("a piece");
+        assert!(matches!(
+            p.kind,
+            PieceKind::Cannon | PieceKind::Horse | PieceKind::Elephant | PieceKind::Soldier
+        ));
+        let mut g2 = GameState::new();
+        g2.apply(m);
+        let r = crate::ai::book::book_move(&g2, 1).expect("a book reply for Black");
+        g2.apply(r);
+        assert!(
+            crate::ai::book::book_move(&g2, 7).is_none(),
+            "book covers only the first move per side"
         );
     }
 

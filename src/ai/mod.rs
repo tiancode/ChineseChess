@@ -9,6 +9,7 @@ use crate::board::{Color, Move};
 use crate::game::GameState;
 
 pub mod alphazero;
+pub mod book;
 pub mod search;
 
 pub trait Engine: Send {
