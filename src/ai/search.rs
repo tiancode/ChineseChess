@@ -325,6 +325,237 @@ fn psqt_abs(board: &Board) -> i32 {
     score
 }
 
+// ----------------------------------------------------------------------------
+// Positional evaluation (Phase 4): king/palace safety, mobility, Xiangqi
+// shape knowledge. Kept *separate* from the incremental `psqt_abs` accumulator
+// (which stays pure material+PST so the debug parity assert holds) and
+// recomputed only where a static score is needed (qsearch stand-pat, the
+// pruning eval). All terms are Red-absolute (Red positive).
+// ----------------------------------------------------------------------------
+
+/// Sum of non-king material weights still on the board, 0..=PHASE_MAX, used to
+/// taper king safety down toward the endgame.
+// Per side: 2 chariots(4) + 2 cannons(2) + 2 horses(2) + 2 advisors(1) +
+// 2 elephants(1) = 20; both sides = 40.
+const PHASE_MAX: i32 = 40;
+
+fn game_phase(board: &Board) -> i32 {
+    let mut p = 0;
+    for c in board.cells.iter().flatten() {
+        p += match c.kind {
+            PieceKind::Chariot => 4,
+            PieceKind::Cannon | PieceKind::Horse => 2,
+            PieceKind::Advisor | PieceKind::Elephant => 1,
+            _ => 0,
+        };
+    }
+    p.min(PHASE_MAX)
+}
+
+fn general_sq(board: &Board, color: Color) -> Option<usize> {
+    board.cells.iter().enumerate().find_map(|(sq, c)| match c {
+        Some(p) if p.kind == PieceKind::General && p.color == color => Some(sq),
+        _ => None,
+    })
+}
+
+/// Empty squares a rook-style slider reaches along `dirs` until the first
+/// piece; a blocking enemy counts as one (the capture keeps it active).
+fn slide_mobility(board: &Board, sq: usize, mine: Color, dirs: &[(i32, i32)]) -> i32 {
+    let (f0, r0) = (file_of(sq), rank_of(sq));
+    let mut m = 0;
+    for &(df, dr) in dirs {
+        let (mut f, mut r) = (f0 + df, r0 + dr);
+        while on_board(f, r) {
+            match board.get(idx(f, r)) {
+                None => m += 1,
+                Some(p) => {
+                    if p.color != mine {
+                        m += 1;
+                    }
+                    break;
+                }
+            }
+            f += df;
+            r += dr;
+        }
+    }
+    m
+}
+
+const ROOK_DIRS: [(i32, i32); 4] = [(1, 0), (-1, 0), (0, 1), (0, -1)];
+const HORSE_MOVES: [(i32, i32, i32, i32); 8] = [
+    // (df, dr, leg_df, leg_dr): the leg is the orthogonal square that, if
+    // occupied, blocks the move (蹩马腿).
+    (1, 2, 0, 1),
+    (-1, 2, 0, 1),
+    (1, -2, 0, -1),
+    (-1, -2, 0, -1),
+    (2, 1, 1, 0),
+    (2, -1, 1, 0),
+    (-2, 1, -1, 0),
+    (-2, -1, -1, 0),
+];
+
+fn horse_mobility(board: &Board, sq: usize, mine: Color) -> i32 {
+    let (f0, r0) = (file_of(sq), rank_of(sq));
+    let mut m = 0;
+    for &(df, dr, lf, lr) in &HORSE_MOVES {
+        if !on_board(f0 + lf, r0 + lr) || board.get(idx(f0 + lf, r0 + lr)).is_some() {
+            continue; // leg blocked
+        }
+        let (f, r) = (f0 + df, r0 + dr);
+        if on_board(f, r) && board.get(idx(f, r)).map(|p| p.color) != Some(mine) {
+            m += 1;
+        }
+    }
+    m
+}
+
+/// Red-absolute positional score added on top of material+PST.
+fn positional_abs(board: &Board) -> i32 {
+    let phase = game_phase(board);
+    let mut acc = 0i32;
+    // Per-color piece tallies for the king-safety interaction terms.
+    let mut chariots = [0i32; 2];
+    let mut cannons = [0i32; 2];
+    let mut horses = [0i32; 2];
+    let mut adv = [0i32; 2];
+    let mut ele = [0i32; 2];
+    let ci = |c: Color| if c == Color::Red { 0usize } else { 1 };
+    for c in board.cells.iter().flatten() {
+        match c.kind {
+            PieceKind::Chariot => chariots[ci(c.color)] += 1,
+            PieceKind::Cannon => cannons[ci(c.color)] += 1,
+            PieceKind::Horse => horses[ci(c.color)] += 1,
+            PieceKind::Advisor => adv[ci(c.color)] += 1,
+            PieceKind::Elephant => ele[ci(c.color)] += 1,
+            _ => {}
+        }
+    }
+    // Red-absolute helper: `good` adds for the side, `bad` subtracts.
+    let mut add = |c: Color, v: i32| acc += if c == Color::Red { v } else { -v };
+
+    for &c in &[Color::Red, Color::Black] {
+        let opp = c.opposite();
+        let (me, en) = (ci(c), ci(opp));
+
+        // --- Defensive-shape integrity, scaled by enemy heavy material and
+        //     game phase: 缺士怕双车 (no advisors vs chariots) /
+        //     缺象怕炮 (no elephants vs cannons).
+        let miss_adv = 2 - adv[me];
+        let miss_ele = 2 - ele[me];
+        let pen = miss_adv * (10 + 7 * chariots[en]) + miss_ele * (8 + 7 * cannons[en]);
+        add(c, -pen * phase / PHASE_MAX);
+
+        // --- Pressure on the general's file by enemy chariots / cannons.
+        if let Some(gsq) = general_sq(board, c) {
+            let gf = file_of(gsq);
+            let gr = rank_of(gsq);
+            // Walk the file away from the general in both rank directions,
+            // counting blockers until we meet an enemy chariot/cannon.
+            for dir in [-1i32, 1] {
+                let mut blockers = 0;
+                let mut r = gr + dir;
+                while (0..10).contains(&r) {
+                    if let Some(p) = board.get(idx(gf, r)) {
+                        if p.color == opp
+                            && matches!(p.kind, PieceKind::Chariot | PieceKind::Cannon)
+                        {
+                            let threat = match (p.kind, blockers) {
+                                (PieceKind::Chariot, 0) => 55, // open file at the king
+                                (PieceKind::Chariot, 1) => 18,
+                                (PieceKind::Cannon, 0) => 60, // 空头炮 hollow cannon
+                                (PieceKind::Cannon, 1) => 38, // screened: can check
+                                _ => 0,
+                            };
+                            add(c, -threat * phase / PHASE_MAX);
+                            break;
+                        }
+                        blockers += 1;
+                        if blockers >= 2 {
+                            break;
+                        }
+                    }
+                    r += dir;
+                }
+            }
+        }
+    }
+
+    // Per-piece terms: mobility, chariot files, horse shape, soldier chains.
+    for (sq, cell) in board.cells.iter().enumerate() {
+        let Some(p) = cell else { continue };
+        let c = p.color;
+        let f = file_of(sq);
+        let r = rank_of(sq);
+        match p.kind {
+            PieceKind::Chariot => {
+                add(c, 2 * slide_mobility(board, sq, c, &ROOK_DIRS));
+                // Open / half-open file (no friendly soldiers; bonus if no
+                // enemy soldiers either).
+                let mut friendly_p = false;
+                let mut enemy_p = false;
+                for rr in 0..10 {
+                    if let Some(q) = board.get(idx(f, rr)) {
+                        if q.kind == PieceKind::Soldier {
+                            if q.color == c {
+                                friendly_p = true;
+                            } else {
+                                enemy_p = true;
+                            }
+                        }
+                    }
+                }
+                if !friendly_p {
+                    add(c, if enemy_p { 12 } else { 18 });
+                }
+            }
+            PieceKind::Horse => {
+                add(c, 3 * horse_mobility(board, sq, c));
+                if f == 0 || f == 8 {
+                    add(c, -6); // rim horse
+                }
+                // 窝心马: horse stuck on the central palace point.
+                if f == 4 && in_palace(c, f, r) {
+                    add(c, -15);
+                }
+            }
+            PieceKind::Cannon => {
+                add(c, slide_mobility(board, sq, c, &ROOK_DIRS));
+            }
+            PieceKind::Soldier if crossed_river(c, r) => {
+                // Connected advanced soldiers support each other.
+                for df in [-1i32, 1] {
+                    let nf = f + df;
+                    if on_board(nf, r) {
+                        if let Some(q) = board.get(idx(nf, r)) {
+                            if q.color == c && q.kind == PieceKind::Soldier {
+                                add(c, 4);
+                            }
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    acc
+}
+
+/// Static evaluation from `side`'s perspective: incremental material+PST
+/// (`mat`, Red-absolute) plus the recomputed positional terms, oriented.
+#[inline]
+fn evaluate(board: &Board, side: Color, mat: i32) -> i32 {
+    let abs = mat + positional_abs(board);
+    if side == Color::Red {
+        abs
+    } else {
+        -abs
+    }
+}
+
 /// Incremental deltas applied when `mv` is made on `board` (read **before**
 /// `board.make`): the XOR to fold into the running Zobrist key, and the change
 /// to the Red-absolute psqt accumulator. Xiangqi has no promotion, so the
@@ -630,7 +861,7 @@ impl SearchEngine {
             return 0;
         }
         debug_assert_eq!(mat, psqt_abs(board), "incremental psqt drift (qsearch)");
-        let stand = if side == Color::Red { mat } else { -mat };
+        let stand = evaluate(board, side, mat);
         if stand >= beta {
             return beta;
         }
@@ -837,11 +1068,7 @@ impl SearchEngine {
         let mate_zone = alpha <= -MATE_THRESHOLD || beta >= MATE_THRESHOLD;
         let prunable = !is_pv && !here_check && !mate_zone;
         let eval = if prunable {
-            if side == Color::Red {
-                mat
-            } else {
-                -mat
-            }
+            evaluate(board, side, mat)
         } else {
             0
         };
@@ -1310,5 +1537,96 @@ mod see_tests {
         let before = b.cells;
         let _ = see(&mut b, mv(4, 5, 4, 3));
         assert!(b.cells == before, "SEE must leave the board untouched");
+    }
+}
+
+#[cfg(test)]
+mod eval_tests {
+    //! Phase-4 positional-knowledge fixtures. Each compares two positions that
+    //! differ in exactly one factor and asserts the sign of the change.
+    use super::*;
+    use crate::game::GameState;
+
+    fn put(b: &mut Board, f: i32, r: i32, kind: PieceKind, color: Color) {
+        b.cells[idx(f, r)] = Some(Piece { kind, color });
+    }
+    fn kings(b: &mut Board) {
+        put(b, 4, 9, PieceKind::General, Color::Red);
+        put(b, 4, 0, PieceKind::General, Color::Black);
+    }
+
+    #[test]
+    fn start_position_is_symmetric() {
+        let b = GameState::new().board;
+        assert_eq!(game_phase(&b), PHASE_MAX, "all material present");
+        assert_eq!(positional_abs(&b), 0, "mirror position must be even");
+    }
+
+    #[test]
+    fn missing_advisors_vs_chariots_favours_the_attacker() {
+        let mut base = Board::empty();
+        kings(&mut base);
+        put(&mut base, 0, 9, PieceKind::Chariot, Color::Red);
+        put(&mut base, 8, 9, PieceKind::Chariot, Color::Red);
+        let mut with = base;
+        put(&mut with, 3, 0, PieceKind::Advisor, Color::Black);
+        put(&mut with, 5, 0, PieceKind::Advisor, Color::Black);
+        // Black keeping its advisors must be better for Black, i.e. the
+        // Red-absolute score is lower than when they are missing.
+        assert!(
+            positional_abs(&base) > positional_abs(&with),
+            "缺士怕双车: {} vs {}",
+            positional_abs(&base),
+            positional_abs(&with)
+        );
+    }
+
+    #[test]
+    fn hollow_cannon_beats_an_offside_cannon() {
+        let mut base = Board::empty();
+        kings(&mut base);
+        put(&mut base, 0, 9, PieceKind::Chariot, Color::Red); // phase
+        put(&mut base, 0, 0, PieceKind::Chariot, Color::Black);
+        let mut hollow = base;
+        put(&mut hollow, 4, 5, PieceKind::Cannon, Color::Red); // faces 黑将 on file 4
+        let mut offside = base;
+        put(&mut offside, 1, 5, PieceKind::Cannon, Color::Red);
+        assert!(
+            positional_abs(&hollow) > positional_abs(&offside),
+            "空头炮 should pressure the general: {} vs {}",
+            positional_abs(&hollow),
+            positional_abs(&offside)
+        );
+    }
+
+    #[test]
+    fn central_palace_horse_is_penalised() {
+        let mut center = Board::empty();
+        kings(&mut center);
+        put(&mut center, 4, 8, PieceKind::Horse, Color::Red); // 窝心马
+        let mut normal = Board::empty();
+        kings(&mut normal);
+        put(&mut normal, 2, 7, PieceKind::Horse, Color::Red);
+        assert!(
+            positional_abs(&center) < positional_abs(&normal),
+            "窝心马 penalty: {} vs {}",
+            positional_abs(&center),
+            positional_abs(&normal)
+        );
+    }
+
+    #[test]
+    fn chariot_likes_an_open_file() {
+        let mut open = Board::empty();
+        kings(&mut open);
+        put(&mut open, 0, 9, PieceKind::Chariot, Color::Red);
+        let mut blocked = open;
+        put(&mut blocked, 0, 4, PieceKind::Soldier, Color::Red); // own pawn on the file
+        assert!(
+            positional_abs(&open) > positional_abs(&blocked),
+            "open file bonus: {} vs {}",
+            positional_abs(&open),
+            positional_abs(&blocked)
+        );
     }
 }
