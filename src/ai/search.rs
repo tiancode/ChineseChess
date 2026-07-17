@@ -942,12 +942,17 @@ impl SearchEngine {
     }
 }
 
+/// Value of the piece on `sq` (0 if empty): the victim lookup shared by
+/// MVV-LVA ordering and quiescence delta pruning.
+#[inline]
+fn piece_value_on(board: &Board, sq: usize) -> i32 {
+    board.get(sq).map(|p| base_value(p.kind)).unwrap_or(0)
+}
+
 /// MVV-LVA score for a capture (victim heavily outweighs attacker).
 #[inline]
 fn mvv_lva(board: &Board, m: Move) -> i32 {
-    let victim = board.get(m.to).map(|p| base_value(p.kind)).unwrap_or(0);
-    let attacker = board.get(m.from).map(|p| base_value(p.kind)).unwrap_or(0);
-    victim * 16 - attacker
+    piece_value_on(board, m.to) * 16 - piece_value_on(board, m.from)
 }
 
 /// History "gravity" update: pulls the entry toward ±HISTORY_MAX by `bonus`
@@ -1048,9 +1053,12 @@ fn see(board: &mut Board, mv: Move) -> i32 {
     s
 }
 
-/// Order quiescence captures by MVV-LVA (SEE pruning is applied in the loop).
+/// Order quiescence moves by MVV-LVA, captures first (SEE/delta pruning is
+/// applied in the loop). On an in-check node the list also holds quiet
+/// evasions: `mvv_lva` gives them a victim of 0, i.e. after every capture,
+/// ordered cheapest mover first — keep that property when touching `mvv_lva`.
 fn order_captures(board: &Board, moves: &mut [Move]) {
-    moves.sort_by_key(|m| -mvv_lva(board, *m));
+    moves.sort_by_cached_key(|m| -mvv_lva(board, *m));
 }
 
 #[inline]
@@ -1062,6 +1070,10 @@ fn captures_only(board: &Board, moves: Vec<Move>) -> Vec<Move> {
 }
 
 impl SearchEngine {
+    /// `known_check`: whether `side` is in check, when the caller (the main
+    /// search) already computed it — `None` recomputes. Saves a full attack
+    /// scan at every quiescence entry node.
+    #[allow(clippy::too_many_arguments)]
     fn quiescence(
         &mut self,
         board: &mut Board,
@@ -1070,6 +1082,7 @@ impl SearchEngine {
         beta: i32,
         mat: i32,
         ply: usize,
+        known_check: Option<bool>,
     ) -> i32 {
         self.nodes += 1;
         if self.time_up() {
@@ -1083,7 +1096,8 @@ impl SearchEngine {
         // option): search every evasion and recognise mate. A checking
         // sequence in quiescence can only continue through capture-checks, so
         // the tree stays small; the ply cap above bounds it regardless.
-        let checked = self.tuning.qevasion && in_check(board, side);
+        let checked =
+            self.tuning.qevasion && known_check.unwrap_or_else(|| in_check(board, side));
         let mut stand = -INF;
         if !checked {
             stand = evaluate(board, side, mat);
@@ -1099,31 +1113,33 @@ impl SearchEngine {
         if checked && pseudo.is_empty() {
             return -MATE + ply as i32; // mated in quiescence
         }
-        let mut caps = if checked {
+        let mut moves = if checked {
             pseudo // all evasions: they are forced, never pruned
         } else {
             captures_only(board, pseudo)
         };
-        order_captures(board, &mut caps);
-        for mv in caps {
+        order_captures(board, &mut moves);
+        for mv in moves {
             if !checked {
+                // Delta pruning first (a single lookup): even winning the
+                // victim outright plus a safety margin leaves the score below
+                // alpha. SEE walks the whole exchange, so it only runs for
+                // captures delta pruning keeps.
+                if self.tuning.qdelta
+                    && stand + piece_value_on(board, mv.to) + QDELTA_MARGIN <= alpha
+                {
+                    continue;
+                }
                 // Skip captures that lose material by static exchange: they
                 // cannot raise alpha above stand-pat, only inflate the q-tree.
                 if self.tuning.see_qprune && see(board, mv) < 0 {
                     continue;
                 }
-                // Delta pruning: even winning the victim outright (plus a
-                // safety margin) leaves the score below alpha.
-                if self.tuning.qdelta {
-                    let victim = board.get(mv.to).map(|p| base_value(p.kind)).unwrap_or(0);
-                    if stand + victim + QDELTA_MARGIN <= alpha {
-                        continue;
-                    }
-                }
             }
             let (_, dm) = move_delta(board, mv);
             let captured = board.make(mv);
-            let score = -self.quiescence(board, side.opposite(), -beta, -alpha, mat + dm, ply + 1);
+            let score =
+                -self.quiescence(board, side.opposite(), -beta, -alpha, mat + dm, ply + 1, None);
             board.unmake(mv, captured);
             if self.aborted {
                 return 0;
@@ -1284,13 +1300,13 @@ impl SearchEngine {
         // a forcing line, so without this cap a long (non-repeating) checking
         // sequence recurses until the stack overflows. `path_dep` is already
         // cleared and the perpetual-check repetition test above has had its
-        // say. In check, quiescence (captures only) would miss forced
-        // evasions, so use the static eval there instead.
+        // say. In check, return the static eval directly (quiescence's own
+        // ply cap would do the same after one more call).
         if ply >= MAX_PLY {
             return if here_check {
                 evaluate(board, side, mat)
             } else {
-                self.quiescence(board, side, alpha, beta, mat, ply)
+                self.quiescence(board, side, alpha, beta, mat, ply, Some(false))
             };
         }
 
@@ -1308,7 +1324,7 @@ impl SearchEngine {
         }
 
         if depth <= 0 {
-            return self.quiescence(board, side, alpha, beta, mat, ply);
+            return self.quiescence(board, side, alpha, beta, mat, ply, Some(here_check));
         }
 
         let mut moves = legal_moves(board, side);
@@ -1344,7 +1360,8 @@ impl SearchEngine {
         // shot could save it — let quiescence confirm a fail-low.
         if self.tuning.razor && prunable && depth <= RAZOR_MAX_DEPTH && eval + RAZOR_MARGIN < alpha
         {
-            let q = self.quiescence(board, side, alpha, beta, mat, ply);
+            // `prunable` implies not in check.
+            let q = self.quiescence(board, side, alpha, beta, mat, ply, Some(false));
             if self.aborted {
                 self.path_dep = false;
                 return 0;
@@ -1430,12 +1447,11 @@ impl SearchEngine {
 
             // Futility: at shallow depth with the eval hopelessly below
             // alpha, a quiet move cannot recover — unless it gives check
-            // (only known after `make`, so the skip happens below). Never on
-            // the first move, and only once a non-mated score exists.
+            // (only known after `make`, so the skip happens below). Only once
+            // a non-mated score exists, which also spares the first move.
             let futile = self.tuning.futility
                 && prunable
                 && quiet
-                && !first
                 && depth <= FUT_MAX_DEPTH
                 && best_score > -MATE_THRESHOLD
                 && eval + FUT_BASE + FUT_MARGIN * depth as i32 <= alpha;
@@ -1690,10 +1706,10 @@ impl SearchEngine {
     ) -> Option<Move> {
         let mut best = root_moves[0];
         let mut best_pool = vec![root_moves[0]];
-        // Scores from the last completed depth: they order the next
+        // The last completed depth's `scored` list: it orders the next
         // iteration's root moves best-first, which is what makes the
         // zero-window scout below cheap (most moves fail low immediately).
-        let mut prev_scores: Vec<(Move, i32)> = Vec::new();
+        let mut prev_scores: Vec<(Move, i32, bool)> = Vec::new();
 
         // Inside the opening-variety window every root move needs an exact
         // score (the pool admits anything within OPENING_MARGIN), so the
@@ -1704,19 +1720,18 @@ impl SearchEngine {
         for depth in 1..=self.max_depth as i16 {
             let key = zkey(root_board, side);
             let mat = psqt_abs(root_board);
-            let tt_move = self.tt.probe(key).and_then(|e| e.best);
             let mut moves = root_moves.to_vec();
             if prev_scores.is_empty() {
+                let tt_move = self.tt.probe(key).and_then(|e| e.best);
                 self.order(root_board, &mut moves, tt_move.or(Some(best)), 0, None);
             } else {
-                let score_of = |m: &Move| {
-                    prev_scores
+                moves.sort_by_cached_key(|m| {
+                    -prev_scores
                         .iter()
-                        .find(|(pm, _)| pm == m)
-                        .map(|&(_, s)| s)
-                        .unwrap_or(-INF)
-                };
-                moves.sort_by_key(|m| -score_of(m));
+                        .find(|(pm, _, _)| pm == m)
+                        .map(|&(_, s, _)| s)
+                        .expect("every root move was scored last iteration")
+                });
             }
 
             let mut best_score = -INF;
@@ -1729,47 +1744,32 @@ impl SearchEngine {
 
             for mv in moves.iter() {
                 let (kx, dm) = move_delta(root_board, *mv);
+                let (ckey, cmat) = (key ^ kx, mat + dm);
                 let captured = root_board.make(*mv);
-                let (score, exact) = if !scout || best_score == -INF {
-                    let s = -self.search(
+                // One child-search shape, three windows below: the
+                // incremental key/psqt threading lives in exactly one place.
+                let mut child = |s: &mut Self, a: i32, b: i32| {
+                    -s.search(
                         root_board,
                         side.opposite(),
                         depth - 1,
-                        -INF,
-                        INF,
+                        a,
+                        b,
                         1,
                         Some(*mv),
-                        key ^ kx,
-                        mat + dm,
-                    );
-                    (s, true)
+                        ckey,
+                        cmat,
+                    )
+                };
+                let (score, exact) = if !scout || best_score == -INF {
+                    (child(self, -INF, INF), true)
                 } else {
                     // Zero-window scout against the current best; open the
                     // window again only on a fail-high (PVS at the root).
-                    let mut s = -self.search(
-                        root_board,
-                        side.opposite(),
-                        depth - 1,
-                        -best_score - 1,
-                        -best_score,
-                        1,
-                        Some(*mv),
-                        key ^ kx,
-                        mat + dm,
-                    );
+                    let mut s = child(self, -best_score - 1, -best_score);
                     let mut ex = false;
                     if !self.aborted && s > best_score {
-                        s = -self.search(
-                            root_board,
-                            side.opposite(),
-                            depth - 1,
-                            -INF,
-                            -best_score,
-                            1,
-                            Some(*mv),
-                            key ^ kx,
-                            mat + dm,
-                        );
+                        s = child(self, -INF, -best_score);
                         // Search instability can drop the re-search back
                         // below best; the value is then only a bound again.
                         ex = s > best_score;
@@ -1813,7 +1813,7 @@ impl SearchEngine {
                     self.tt
                         .store(key, depth, best_score, Bound::Exact, Some(local_best));
                 }
-                prev_scores = scored.iter().map(|&(m, s, _)| (m, s)).collect();
+                prev_scores = scored;
             } else {
                 break; // ran out of time; keep the last completed depth
             }
@@ -1866,6 +1866,13 @@ impl SearchEngine {
     }
 }
 
+/// Shared test helper: drop a piece on the board (the test modules below pick
+/// it up via `use super::*`).
+#[cfg(test)]
+fn put(b: &mut Board, f: i32, r: i32, kind: PieceKind, color: Color) {
+    b.cells[idx(f, r)] = Some(Piece { kind, color });
+}
+
 #[cfg(test)]
 mod see_tests {
     //! Static Exchange Evaluation on hand-built positions. Coordinates are in
@@ -1873,9 +1880,6 @@ mod see_tests {
     //! come from `base_value` (Chariot 1000, Soldier 100).
     use super::*;
 
-    fn put(b: &mut Board, f: i32, r: i32, kind: PieceKind, color: Color) {
-        b.cells[idx(f, r)] = Some(Piece { kind, color });
-    }
     fn mv(f0: i32, r0: i32, f1: i32, r1: i32) -> Move {
         Move { from: idx(f0, r0), to: idx(f1, r1) }
     }
@@ -1950,10 +1954,6 @@ mod qsearch_tests {
     //! recognise mate instead of trusting an invalid stand-pat.
     use super::*;
 
-    fn put(b: &mut Board, f: i32, r: i32, kind: PieceKind, color: Color) {
-        b.cells[idx(f, r)] = Some(Piece { kind, color });
-    }
-
     /// Red general checked on file 4 with every flight square covered: the
     /// quiescence search itself must return a mate score, not a stand-pat.
     #[test]
@@ -1967,7 +1967,7 @@ mod qsearch_tests {
         let mat = psqt_abs(&b);
         let mut e = SearchEngine::fixed_depth(1);
         let ply = 3;
-        let s = e.quiescence(&mut b, Color::Red, -INF, INF, mat, ply);
+        let s = e.quiescence(&mut b, Color::Red, -INF, INF, mat, ply, None);
         assert_eq!(s, -MATE + ply as i32, "checkmated in quiescence: {s}");
 
         // Same shape with an open flight square is not mate: the score must
@@ -1976,7 +1976,7 @@ mod qsearch_tests {
         let mut b2 = b;
         b2.cells[idx(5, 8)] = None; // (5,9) is free now
         let mat2 = psqt_abs(&b2);
-        let s2 = e.quiescence(&mut b2, Color::Red, -INF, INF, mat2, ply);
+        let s2 = e.quiescence(&mut b2, Color::Red, -INF, INF, mat2, ply, None);
         assert!(s2 > -MATE_THRESHOLD, "an evasion exists, not mate: {s2}");
     }
 
@@ -1991,7 +1991,7 @@ mod qsearch_tests {
         put(&mut b, 4, 4, PieceKind::Chariot, Color::Black); // checks, out of reach
         let mat = psqt_abs(&b);
         let mut e = SearchEngine::fixed_depth(1);
-        let s = e.quiescence(&mut b, Color::Red, -INF, INF, mat, 3);
+        let s = e.quiescence(&mut b, Color::Red, -INF, INF, mat, 3, None);
         assert!(
             s.abs() < MATE_THRESHOLD,
             "general steps aside; no mate, no free chariot: {s}"
@@ -2008,9 +2008,6 @@ mod eval_tests {
     use super::*;
     use crate::game::GameState;
 
-    fn put(b: &mut Board, f: i32, r: i32, kind: PieceKind, color: Color) {
-        b.cells[idx(f, r)] = Some(Piece { kind, color });
-    }
     fn kings(b: &mut Board) {
         put(b, 4, 9, PieceKind::General, Color::Red);
         put(b, 4, 0, PieceKind::General, Color::Black);
